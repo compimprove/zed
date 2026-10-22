@@ -793,13 +793,21 @@ impl SplittableEditor {
                     split,
                 } => {
                     if this.lhs.is_some() {
-                        let translated =
+                        let mut translated =
                             translate_lhs_selections_to_rhs(selections_by_buffer, this, cx);
+                        this.rhs_editor.update(cx, |editor, cx| {
+                            editor.open_buffers_via_addons(&mut translated, window, cx);
+                        });
                         if !translated.is_empty() {
                             let workspace = this.workspace.clone();
                             let split = *split;
                             Editor::open_buffers_in_workspace(
-                                workspace, translated, split, window, cx,
+                                workspace,
+                                translated,
+                                this.rhs_multibuffer.clone(),
+                                split,
+                                window,
+                                cx,
                             );
                         }
                     }

@@ -204,6 +204,8 @@ pub struct SearchSettings {
     pub center_on_match: bool,
     /// Start searching as you type in project search, without pressing Enter.
     pub search_on_type: bool,
+    /// Whether to show the project search results as a file tree next to them.
+    pub results_tree: bool,
 }
 
 impl EditorSettings {
@@ -311,6 +313,7 @@ impl Settings for EditorSettings {
                 regex: search.regex.unwrap(),
                 center_on_match: search.center_on_match.unwrap(),
                 search_on_type: search.search_on_type.unwrap(),
+                results_tree: search.results_tree.unwrap(),
             },
             auto_signature_help: editor.auto_signature_help.unwrap(),
             language_detection: editor.language_detection.unwrap(),

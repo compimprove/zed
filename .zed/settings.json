@@ -1,4 +1,5 @@
 {
+  "enable_language_server": false,
   "languages": {
     "Docker Compose": {
       "tab_size": 2,

@@ -1020,6 +1020,8 @@ pub struct SearchSettingsContent {
     pub center_on_match: Option<bool>,
     /// Start searching as you type in project search, without pressing Enter.
     pub search_on_type: Option<bool>,
+    /// Whether to show the project search results as a file tree next to them.
+    pub results_tree: Option<bool>,
 }
 
 #[with_fallible_options]

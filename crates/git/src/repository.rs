@@ -491,7 +491,7 @@ impl UpstreamTracking {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RemoteCommandOutput {
     pub stdout: String,
     pub stderr: String,
@@ -924,6 +924,16 @@ pub trait GitRepository: Send + Sync {
         ignore_shallow_boundary: bool,
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    /// Loads the files that differ between `base` and `target`, or between
+    /// their merge base and `target` when `merge_base` is set.
+    fn load_range_diff(
+        &self,
+        base: String,
+        target: String,
+        merge_base: bool,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>>;
     fn blame(
         &self,
         path: RepoPath,
@@ -1016,6 +1026,18 @@ pub trait GitRepository: Send + Sync {
         remote_branch_name: String,
         upstream_name: String,
         options: Option<PushOptions>,
+        askpass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        // This method takes an AsyncApp to ensure it's invoked on the main thread,
+        // otherwise git-credentials-manager won't work.
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RemoteCommandOutput>>;
+
+    /// Runs `git` with the given arguments in the repository, answering
+    /// credential prompts through `askpass`.
+    fn run_git_command(
+        &self,
+        args: Vec<String>,
         askpass: AskPassDelegate,
         env: Arc<HashMap<String, String>>,
         // This method takes an AsyncApp to ensure it's invoked on the main thread,
@@ -1498,70 +1520,48 @@ impl GitRepository for RealGitRepository {
             );
 
             let show_stdout = String::from_utf8_lossy(&show_output.stdout);
-            let changes = parse_git_diff_raw(&show_stdout);
+            let files = load_diff_files(&git, &show_stdout).await?;
 
-            let mut cat_file_process = git
-                .build_command(&["cat-file", "--batch=%(objectsize)"])
-                .stdin(Stdio::piped())
+            Ok(CommitDiff {
+                files,
+                is_shallow_boundary: false,
+            })
+        })
+        .boxed()
+    }
+
+    fn load_range_diff(
+        &self,
+        base: String,
+        target: String,
+        merge_base: bool,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        let git = self.git_binary();
+        cx.background_spawn(async move {
+            let mut command =
+                git.build_command(&["diff", "-z", "--no-renames", "--raw", "--no-abbrev"]);
+            if merge_base {
+                command.arg("--merge-base");
+            }
+            let diff_output = command
+                .arg(&base)
+                .arg(&target)
+                .arg("--")
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()
-                .context("starting git cat-file process")?;
+                .output()
+                .await
+                .context("starting git diff process")?;
+            anyhow::ensure!(
+                diff_output.status.success(),
+                "git diff failed: {}",
+                String::from_utf8_lossy(&diff_output.stderr)
+            );
 
-            let mut files = Vec::<CommitFile>::new();
-            let stdin = cat_file_process
-                .stdin
-                .take()
-                .context("git cat-file process has no stdin")?;
-            let stdout = cat_file_process
-                .stdout
-                .take()
-                .context("git cat-file process has no stdout")?;
-            let mut stdin = BufWriter::with_capacity(512, stdin);
-            let mut stdout = BufReader::new(stdout);
-            let mut info_line = String::new();
-            let mut newline = [b'\0'];
-            for change in changes {
-                let change = change?;
-                let path = change.path;
-                // git-show outputs `/`-delimited paths even on Windows.
-                let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
-                    continue;
-                };
-
-                let objects = [change.new_object, change.old_object];
-                let mut has_blobs = false;
-                for object in objects.iter().flatten() {
-                    if object.kind == CommitDiffObjectKind::Blob {
-                        stdin.write_all(object.oid.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        has_blobs = true;
-                    }
-                }
-                if has_blobs {
-                    stdin.flush().await?;
-                }
-
-                let [new_object, old_object] = objects;
-                let new_object =
-                    load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let old_object =
-                    load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
-                    || old_object.as_ref().is_some_and(|object| object.is_binary);
-                let new_content = new_object.map(|object| object.content);
-                let old_content = old_object.map(|object| object.content);
-
-                files.push(CommitFile {
-                    path: RepoPath(Arc::from(rel_path)),
-                    old_content,
-                    new_content,
-                    is_binary,
-                })
-            }
-
+            let diff_stdout = String::from_utf8_lossy(&diff_output.stdout);
+            let files = load_diff_files(&git, &diff_stdout).await?;
             Ok(CommitDiff {
                 files,
                 is_shallow_boundary: false,
@@ -2372,13 +2372,19 @@ impl GitRepository for RealGitRepository {
         self.executor
             .spawn(async move {
                 let git_binary = git_binary?;
-                let local_ref = format!("refs/heads/{name}");
-                if git_binary
-                    .run(&["show-ref", "--verify", "--quiet", &local_ref])
+                let ignore_case = git_binary
+                    .run(&["config", "--type=bool", "core.ignorecase"])
                     .await
-                    .is_ok()
-                {
-                    git_binary.run(&["checkout", &name]).await?;
+                    .is_ok_and(|value| value == "true");
+                let local_branches = git_binary
+                    .run(&[
+                        "for-each-ref",
+                        "--format=%(refname:lstrip=2)",
+                        "refs/heads/",
+                    ])
+                    .await?;
+                if let Some(local_branch) = find_local_branch(&local_branches, &name, ignore_case) {
+                    git_binary.run(&["checkout", local_branch]).await?;
                     return anyhow::Ok(());
                 }
 
@@ -2397,22 +2403,21 @@ impl GitRepository for RealGitRepository {
                     };
                     let (_, branch_name) =
                         name.split_once('/').context("Unexpected branch format")?;
-                    let local_branch_ref = format!("refs/heads/{branch_name}");
-                    if git_binary
-                        .run(&["show-ref", "--verify", "--quiet", &local_branch_ref])
-                        .await
-                        .is_ok()
+                    // On case-insensitive filesystems, `refs/heads/Feat/x` resolves to an
+                    // existing `feat/x`, so always use the real name of the local branch.
+                    if let Some(local_branch) =
+                        find_local_branch(&local_branches, branch_name, ignore_case)
                     {
                         git_binary
-                            .run(&["branch", "--set-upstream-to", &name, branch_name])
+                            .run(&["branch", "--set-upstream-to", &name, local_branch])
                             .await?;
+                        git_binary.run(&["checkout", local_branch]).await?;
                     } else {
                         git_binary
                             .run(&["branch", "--track", branch_name, &name])
                             .await?;
+                        git_binary.run(&["checkout", branch_name]).await?;
                     }
-
-                    git_binary.run(&["checkout", branch_name]).await?;
                     return anyhow::Ok(());
                 }
 
@@ -2862,6 +2867,42 @@ impl GitRepository for RealGitRepository {
                 }))
                 .arg(remote_name)
                 .arg(format!("{}:{}", branch_name, remote_branch_name))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            run_git_command(env, ask_pass, command, executor).await
+        }
+        .boxed()
+    }
+
+    fn run_git_command(
+        &self,
+        args: Vec<String>,
+        ask_pass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RemoteCommandOutput>> {
+        let working_directory = self.command_directory();
+        let git_directory = self.path();
+        let executor = cx.background_executor().clone();
+        let git_binary_path = self.system_git_binary_path.clone();
+        let is_trusted = self.is_trusted();
+        // Note: Do not spawn this command on the background thread, it might pop open the credential helper
+        // which we want to block on.
+        async move {
+            let git_binary_path =
+                git_binary_path.context("git not found on $PATH, can't run git")?;
+            let git = GitBinary::new(
+                git_binary_path,
+                working_directory,
+                git_directory,
+                executor.clone(),
+                is_trusted,
+            );
+            let mut command = git.build_command(&args);
+            command
+                .envs(env.iter())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -4298,6 +4339,92 @@ fn checkpoint_author_envs() -> HashMap<String, String> {
     ])
 }
 
+/// Loads the old and new content of every file in `raw_diff`, the
+/// `-z --raw --no-abbrev` output of `git show` or `git diff`.
+async fn load_diff_files(git: &GitBinary, raw_diff: &str) -> Result<Vec<CommitFile>> {
+    let changes = parse_git_diff_raw(raw_diff);
+
+    let mut cat_file_process = git
+        .build_command(&["cat-file", "--batch=%(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting git cat-file process")?;
+
+    let mut files = Vec::<CommitFile>::new();
+    let stdin = cat_file_process
+        .stdin
+        .take()
+        .context("git cat-file process has no stdin")?;
+    let stdout = cat_file_process
+        .stdout
+        .take()
+        .context("git cat-file process has no stdout")?;
+    let mut stdin = BufWriter::with_capacity(512, stdin);
+    let mut stdout = BufReader::new(stdout);
+    let mut info_line = String::new();
+    let mut newline = [b'\0'];
+    for change in changes {
+        let change = change?;
+        let path = change.path;
+        // git-show outputs `/`-delimited paths even on Windows.
+        let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
+            continue;
+        };
+
+        let objects = [change.new_object, change.old_object];
+        let mut has_blobs = false;
+        for object in objects.iter().flatten() {
+            if object.kind == CommitDiffObjectKind::Blob {
+                stdin.write_all(object.oid.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                has_blobs = true;
+            }
+        }
+        if has_blobs {
+            stdin.flush().await?;
+        }
+
+        let [new_object, old_object] = objects;
+        let new_object =
+            load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let old_object =
+            load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
+            || old_object.as_ref().is_some_and(|object| object.is_binary);
+        let new_content = new_object.map(|object| object.content);
+        let old_content = old_object.map(|object| object.content);
+
+        files.push(CommitFile {
+            path: RepoPath(Arc::from(rel_path)),
+            old_content,
+            new_content,
+            is_binary,
+        })
+    }
+
+    Ok(files)
+}
+
+/// Finds the local branch named `name` in `local_branches` (one name per line),
+/// matching case-insensitively when the repository's filesystem ignores case.
+pub fn find_local_branch<'a>(
+    local_branches: &'a str,
+    name: &str,
+    ignore_case: bool,
+) -> Option<&'a str> {
+    let mut branches = local_branches
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty());
+    branches.clone().find(|branch| *branch == name).or_else(|| {
+        ignore_case
+            .then(|| branches.find(|branch| branch.eq_ignore_ascii_case(name)))
+            .flatten()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -5100,6 +5227,136 @@ mod tests {
                 .unwrap(),
             "origin/feature"
         );
+    }
+
+    #[gpui::test]
+    async fn test_change_branch_uses_existing_local_branch_with_different_case(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_remote_directory, clone_directory) =
+            clone_remote_repository_with_main_and_feature(temp_dir.path());
+
+        let repository = RealGitRepository::new(
+            &clone_directory.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let git = repository.git_binary_in_worktree().unwrap();
+        git.run(&["config", "core.ignorecase", "true"])
+            .await
+            .unwrap();
+        git.run(&["branch", "Feature", "origin/feature"])
+            .await
+            .unwrap();
+        git.run(&["branch", "--unset-upstream", "Feature"])
+            .await
+            .unwrap();
+
+        repository
+            .change_branch("origin/feature".to_string())
+            .await
+            .unwrap();
+
+        let git = repository.git_binary_in_worktree().unwrap();
+        assert_eq!(
+            git.run(&["symbolic-ref", "HEAD"]).await.unwrap(),
+            "refs/heads/Feature"
+        );
+        assert_eq!(
+            git.run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}",])
+                .await
+                .unwrap(),
+            "origin/feature"
+        );
+
+        git.run(&["checkout", "main"]).await.unwrap();
+        repository
+            .change_branch("feature".to_string())
+            .await
+            .unwrap();
+        let git = repository.git_binary_in_worktree().unwrap();
+        assert_eq!(
+            git.run(&["symbolic-ref", "HEAD"]).await.unwrap(),
+            "refs/heads/Feature"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_load_range_diff(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        git_init_repo(&repo_dir);
+        fs::write(repo_dir.join("file.txt"), "base").unwrap();
+        git_command(&repo_dir, ["add", "file.txt"]);
+        git_command(&repo_dir, ["commit", "-m", "base"]);
+        git_command(&repo_dir, ["switch", "-c", "feature"]);
+        fs::write(repo_dir.join("feature.txt"), "feature").unwrap();
+        git_command(&repo_dir, ["add", "feature.txt"]);
+        git_command(&repo_dir, ["commit", "-m", "feature"]);
+        git_command(&repo_dir, ["switch", "main"]);
+        fs::write(repo_dir.join("file.txt"), "main").unwrap();
+        git_command(&repo_dir, ["commit", "-am", "main"]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let changed_files = async |merge_base| {
+            let diff = repository
+                .load_range_diff("main".into(), "feature".into(), merge_base, cx.to_async())
+                .await
+                .unwrap();
+            diff.files
+                .into_iter()
+                .map(|file| {
+                    (
+                        file.path.as_unix_str().to_string(),
+                        file.old_content
+                            .map(|content| String::from_utf8(content).unwrap()),
+                        file.new_content
+                            .map(|content| String::from_utf8(content).unwrap()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            changed_files(true).await,
+            [("feature.txt".to_string(), None, Some("feature".to_string()))]
+        );
+        assert_eq!(
+            changed_files(false).await,
+            [
+                ("feature.txt".to_string(), None, Some("feature".to_string())),
+                (
+                    "file.txt".to_string(),
+                    Some("main".to_string()),
+                    Some("base".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_find_local_branch() {
+        let branches = "feat/X\nmain\nFEAT/y\nfeat/y\n";
+        assert_eq!(find_local_branch(branches, "main", false), Some("main"));
+        assert_eq!(find_local_branch(branches, "Feat/X", false), None);
+        assert_eq!(find_local_branch(branches, "Feat/X", true), Some("feat/X"));
+        assert_eq!(find_local_branch(branches, "feat/y", true), Some("feat/y"));
+        assert_eq!(find_local_branch(branches, "other", true), None);
     }
 
     #[gpui::test]

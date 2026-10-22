@@ -645,6 +645,7 @@ pub(crate) fn render_buffer_header(
     let editor_read = editor.read(cx);
     let multi_buffer = editor_read.buffer.read(cx);
     let is_read_only = editor_read.read_only(cx);
+    let buffer_header_folding = editor_read.buffer_header_folding;
     let editor_handle: &dyn ItemHandle = editor;
     let multibuffer_snapshot = multi_buffer.snapshot(cx);
     let buffer = for_excerpt.buffer(&multibuffer_snapshot);
@@ -751,7 +752,7 @@ pub(crate) fn render_buffer_header(
                     s.bg(colors.editor_subheader_background)
                 })
                 .hover(|s| s.bg(colors.element_hover))
-                .map(|header| {
+                .when(buffer_header_folding, |header| {
                     let editor = editor.clone();
                     let buffer_id = for_excerpt.buffer_id();
                     let toggle_chevron_icon =
@@ -984,6 +985,9 @@ pub(crate) fn render_buffer_header(
                                     return;
                                 }
 
+                                if !buffer_header_folding {
+                                    return;
+                                }
                                 if is_folded {
                                     editor.unfold_buffer(buffer_id, cx);
                                 } else {

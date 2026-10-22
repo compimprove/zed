@@ -39,12 +39,15 @@ use crate::{
 pub mod branch_diff;
 pub mod branch_picker;
 mod commit_context_menu;
+pub mod commit_file_view;
 mod commit_modal;
 pub mod commit_tooltip;
 pub mod commit_view;
 mod conflict_view;
 mod diff_multibuffer;
+mod git_action_dialog;
 pub mod git_graph;
+mod git_graph_actions;
 pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
@@ -207,6 +210,14 @@ pub fn init(cx: &mut App) {
                 };
                 panel.update(cx, |panel, cx| {
                     panel.fetch(false, window, cx);
+                });
+            });
+            workspace.register_action(|workspace, _: &git::PruneOrigin, window, cx| {
+                let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    panel.prune_origin(window, cx);
                 });
             });
             workspace.register_action(|workspace, _: &git::Push, window, cx| {
@@ -1204,6 +1215,7 @@ mod remote_button {
                         })
                         .action("Fetch", git::Fetch.boxed_clone())
                         .action("Fetch From", git::FetchFrom.boxed_clone())
+                        .action("Prune origin", git::PruneOrigin.boxed_clone())
                         .action("Pull", git::Pull.boxed_clone())
                         .action("Pull (Rebase)", git::PullRebase.boxed_clone())
                         .separator()

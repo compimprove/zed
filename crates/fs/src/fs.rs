@@ -2538,6 +2538,19 @@ impl FakeFs {
         .unwrap();
     }
 
+    /// Sets the files a commit changed: (path, old text, new text).
+    pub fn set_commit_diff(
+        &self,
+        dot_git: &Path,
+        sha: &str,
+        files: Vec<(RepoPath, Option<String>, Option<String>)>,
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.commit_diffs.insert(sha.to_string(), files);
+        })
+        .unwrap();
+    }
+
     pub fn set_commit_data(
         &self,
         dot_git: &Path,

@@ -20,6 +20,7 @@ use editor::{
     multibuffer_context_lines,
     scroll::Autoscroll,
 };
+use fs::Fs;
 use futures::{StreamExt, stream::FuturesOrdered};
 use gpui::{
     Action, AnyElement, App, AsyncApp, Context, Entity, EntityId, EventEmitter, FocusHandle,
@@ -36,7 +37,7 @@ use project::{
     search::{SearchInputKind, SearchQuery, SearchResult},
     search_history::SearchHistoryCursor,
 };
-use settings::Settings;
+use settings::{Settings, update_settings_file};
 use std::{
     any::{Any, TypeId},
     iter::Peekable,
@@ -76,9 +77,14 @@ actions!(
         /// Toggles collapse/expand state of all search result excerpts.
         ToggleAllSearchResults,
         /// Open a text picker showing the current result in a modal.
-        OpenTextFinder
+        OpenTextFinder,
+        /// Toggles the file tree next to the search results.
+        ToggleResultsTree
     ]
 );
+
+mod results_tree;
+use results_tree::ResultsTree;
 
 fn split_glob_patterns(text: &str) -> Vec<&str> {
     let mut patterns = Vec::new();
@@ -124,6 +130,12 @@ pub fn init(cx: &mut App) {
             workspace,
             move |search_bar, _: &ToggleFilters, window, cx| {
                 search_bar.toggle_filters(window, cx);
+            },
+        );
+        register_workspace_action(
+            workspace,
+            move |search_bar, _: &ToggleResultsTree, _window, cx| {
+                search_bar.toggle_results_tree(cx);
             },
         );
         register_workspace_action(
@@ -380,6 +392,7 @@ pub struct ProjectSearchView {
     regex_language: Option<Arc<Language>>,
     debounced_search: Option<Task<()>>,
     last_search_signature: Option<SearchSignature>,
+    results_tree: ResultsTree,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1030,18 +1043,28 @@ pub enum ViewEvent {
 impl EventEmitter<ViewEvent> for ProjectSearchView {}
 
 impl Render for ProjectSearchView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut key_context = KeyContext::default();
         key_context.add("ProjectSearchView");
 
         if self.has_matches() {
-            div()
+            let results_tree = self
+                .results_tree
+                .visible
+                .then(|| self.render_results_tree(window, cx));
+            h_flex()
                 .key_context(key_context)
                 .on_action(cx.listener(Self::open_text_finder))
                 .flex_1()
                 .size_full()
                 .track_focus(&self.focus_handle(cx))
-                .child(self.results_editor.clone())
+                .children(results_tree)
+                .child(v_flex().flex_1().min_w_0().h_full().map(|this| {
+                    match self.results_tree.file_results.as_ref() {
+                        Some(file_results) => this.child(file_results.editor.clone()),
+                        None => this.child(self.results_editor.clone()),
+                    }
+                }))
         } else {
             let model = self.entity.read(cx);
 
@@ -1570,6 +1593,10 @@ impl ProjectSearchView {
                 if matches!(event, editor::EditorEvent::SelectionsChanged { .. }) {
                     this.update_match_index(cx);
                 }
+                if matches!(event, editor::EditorEvent::BufferEdited) {
+                    this.results_tree.invalidate();
+                    cx.notify();
+                }
                 // Reraise editor events for workspace item activation purposes
                 cx.emit(ViewEvent::EditorEvent(event.clone()));
             }),
@@ -1614,7 +1641,9 @@ impl ProjectSearchView {
             cx.on_next_frame(window, |this, window, cx| {
                 if this.focus_handle.is_focused(window) {
                     if this.has_matches() {
-                        this.results_editor.focus_handle(cx).focus(window, cx);
+                        this.visible_results_editor()
+                            .focus_handle(cx)
+                            .focus(window, cx);
                     } else {
                         this.query_editor.focus_handle(cx).focus(window, cx);
                     }
@@ -1660,6 +1689,7 @@ impl ProjectSearchView {
             regex_language: None,
             debounced_search: None,
             last_search_signature: None,
+            results_tree: ResultsTree::new(EditorSettings::get_global(cx).search.results_tree),
             _subscriptions: subscriptions,
         };
 
@@ -2233,21 +2263,43 @@ impl ProjectSearchView {
                 )
             });
 
-            let range_to_select = match_ranges[new_index].clone();
-            self.results_editor.update(cx, |editor, cx| {
-                let range_to_select = editor.range_for_match(&range_to_select);
-                let autoscroll = if EditorSettings::get_global(cx).search.center_on_match {
-                    Autoscroll::center()
-                } else {
-                    Autoscroll::fit()
-                };
-                editor.unfold_ranges(std::slice::from_ref(&range_to_select), false, true, cx);
-                editor.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
-                    s.select_ranges([range_to_select])
-                });
-            });
-            self.highlight_matches(&match_ranges, Some(new_index), cx);
+            self.select_match_at(&match_ranges, new_index, window, cx);
         }
+    }
+
+    fn select_match_at(
+        &mut self,
+        match_ranges: &[Range<Anchor>],
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(range_to_select) = match_ranges.get(index).cloned() else {
+            return;
+        };
+        self.results_editor.update(cx, |editor, cx| {
+            let range_to_select = editor.range_for_match(&range_to_select);
+            let autoscroll = if EditorSettings::get_global(cx).search.center_on_match {
+                Autoscroll::center()
+            } else {
+                Autoscroll::fit()
+            };
+            editor.unfold_ranges(std::slice::from_ref(&range_to_select), false, true, cx);
+            editor.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
+                s.select_ranges([range_to_select])
+            });
+        });
+        self.highlight_matches(match_ranges, Some(index), cx);
+        self.select_match_in_file_results(match_ranges, index, window, cx);
+    }
+
+    fn toggle_results_tree(&mut self, cx: &mut Context<Self>) {
+        let visible = !self.results_tree.visible;
+        self.results_tree.visible = visible;
+        update_settings_file(<dyn Fs>::global(cx), cx, move |settings, _| {
+            settings.editor.search.get_or_insert_default().results_tree = Some(visible);
+        });
+        cx.notify();
     }
 
     fn focus_query_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2326,7 +2378,7 @@ impl ProjectSearchView {
                 s.select_ranges([cursor..cursor])
             });
         });
-        let results_handle = self.results_editor.focus_handle(cx);
+        let results_handle = self.visible_results_editor().focus_handle(cx);
         window.focus(&results_handle, cx);
     }
 
@@ -2359,6 +2411,9 @@ impl ProjectSearchView {
         if match_ranges.is_empty() {
             self.active_match_index = None;
             if !results_stale {
+                self.results_tree.file_results = None;
+            }
+            if !results_stale {
                 self.results_editor.update(cx, |editor, cx| {
                     editor.clear_background_highlights(HighlightKey::ProjectSearchView, cx);
                     if concluded_no_results {
@@ -2377,6 +2432,7 @@ impl ProjectSearchView {
                     mem::replace(&mut self.search_id, self.entity.read(cx).search_id);
                 let is_new_search = self.search_id != prev_search_id;
                 if is_new_search {
+                    self.results_tree.file_results = None;
                     self.results_editor.update(cx, |editor, cx| {
                         let range_to_select = match_ranges
                             .first()
@@ -2425,6 +2481,7 @@ impl ProjectSearchView {
 
         if self.active_match_index != new_index {
             self.active_match_index = new_index;
+            self.results_tree.reveal_active_match();
             cx.notify();
         }
     }
@@ -2450,6 +2507,7 @@ impl ProjectSearchView {
                 cx,
             );
         });
+        self.highlight_file_results(match_ranges, active_index, cx);
     }
 
     pub fn has_matches(&self) -> bool {
@@ -2528,7 +2586,10 @@ impl ProjectSearchView {
     }
 
     fn move_focus_to_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.results_editor.focus_handle(cx).is_focused(window)
+        if !self
+            .visible_results_editor()
+            .focus_handle(cx)
+            .is_focused(window)
             && !self.entity.read(cx).match_ranges.is_empty()
         {
             cx.stop_propagation();
@@ -2755,6 +2816,13 @@ impl ProjectSearchBar {
                 window.focus(&editor_to_focus, cx);
                 cx.notify();
             });
+        }
+    }
+
+    fn toggle_results_tree(&mut self, cx: &mut Context<Self>) {
+        if let Some(search_view) = self.active_project_search.as_ref() {
+            search_view.update(cx, |search_view, cx| search_view.toggle_results_tree(cx));
+            cx.notify();
         }
     }
 
@@ -3163,6 +3231,50 @@ impl Render for ProjectSearchBar {
                             )
                         }
                     }),
+            )
+            .child(
+                IconButton::new("project-search-results-tree-button", IconName::ListTree)
+                    .shape(IconButtonShape::Square)
+                    .toggle_state(
+                        self.active_project_search
+                            .as_ref()
+                            .is_some_and(|search| search.read(cx).results_tree.visible),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_results_tree(cx);
+                    }))
+                    .tooltip({
+                        let focus_handle = focus_handle.clone();
+                        move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "Toggle Results Tree",
+                                &ToggleResultsTree,
+                                &focus_handle,
+                                cx,
+                            )
+                        }
+                    }),
+            )
+            .when(
+                self.active_project_search
+                    .as_ref()
+                    .is_some_and(|search| search.read(cx).results_tree.file_results.is_some()),
+                |this| {
+                    this.child(
+                        Button::new("project-search-show-all-results", "All Results")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Close).size(IconSize::XSmall))
+                            .tooltip(Tooltip::text("Show the results of all files"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(search_view) = this.active_project_search.as_ref() {
+                                    search_view.update(cx, |search_view, cx| {
+                                        search_view.show_all_results(window, cx);
+                                    });
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                },
             )
             .child(render_action_button(
                 "project-search",
@@ -6843,6 +6955,246 @@ pub mod tests {
             let query_text = search_view.query_editor.read(cx).text(cx);
             assert_eq!(query_text, "Uppercase_Query");
         });
+    }
+
+    #[gpui::test]
+    async fn test_results_tree(cx: &mut TestAppContext) {
+        use results_tree::ResultsTreeRow;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "src": {
+                    "one.rs": "let a = TWO;\nlet b = TWO;",
+                    "nested": { "two.rs": "    const TWO: u8 = 2;" },
+                },
+                "README.md": "TWO",
+            }),
+        )
+        .await;
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project.clone(), workspace.downgrade(), cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search.clone(), window, cx, None)
+        });
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(search_view.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+
+        perform_search(search_view, "TWO", cx);
+        cx.run_until_parked();
+        draw(cx);
+
+        let second_match_in_one_rs = search_view
+            .update(cx, |search_view, _, cx| {
+                assert!(search_view.results_tree.visible);
+                search_view.sync_results_tree(cx);
+                let files = search_view.results_tree.files();
+                let mut summary = files
+                    .iter()
+                    .map(|file| (file.path.to_string(), file.matches.len()))
+                    .collect::<Vec<_>>();
+                summary.sort();
+                assert_eq!(
+                    summary,
+                    [
+                        ("README.md".to_string(), 1),
+                        ("src/nested/two.rs".to_string(), 1),
+                        ("src/one.rs".to_string(), 2),
+                    ]
+                );
+
+                let two_rs = files
+                    .iter()
+                    .find(|file| file.path.as_ref() == "src/nested/two.rs")
+                    .unwrap();
+                let preview = &two_rs.matches[0];
+                assert_eq!(preview.preview.as_ref(), "const TWO: u8 = 2;");
+                assert_eq!(&preview.preview[preview.highlight.clone()], "TWO");
+
+                let one_rs = files
+                    .iter()
+                    .find(|file| file.path.as_ref() == "src/one.rs")
+                    .unwrap();
+                assert_eq!(one_rs.matches[1].row, 1);
+
+                // Directories come first and files start collapsed.
+                let names = search_view
+                    .results_tree
+                    .rows()
+                    .iter()
+                    .map(|row| match row {
+                        ResultsTreeRow::Directory { name, .. } => format!("{name}/"),
+                        ResultsTreeRow::File { file_ix, .. } => files[*file_ix].path.to_string(),
+                        ResultsTreeRow::Match { .. } => "match".to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    [
+                        "src/",
+                        "nested/",
+                        "src/nested/two.rs",
+                        "src/one.rs",
+                        "README.md"
+                    ]
+                );
+                one_rs.matches[1].index
+            })
+            .unwrap();
+
+        // Clicking a match in the tree selects it in the results.
+        search_view
+            .update(cx, |search_view, window, cx| {
+                search_view.activate_match_from_tree(second_match_in_one_rs, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        search_view
+            .update(cx, |search_view, _, cx| {
+                assert_eq!(search_view.active_match_index, Some(second_match_in_one_rs));
+                let selected = search_view.results_editor.update(cx, |editor, cx| {
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let range = editor.selections.newest_anchor().range();
+                    snapshot.text_for_range(range).collect::<String>()
+                });
+                assert_eq!(selected, "TWO");
+            })
+            .unwrap();
+
+        fn selected_text(editor: &Entity<Editor>, cx: &mut App) -> String {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let range = editor.selections.newest_anchor().range();
+                snapshot.text_for_range(range).collect::<String>()
+            })
+        }
+
+        // The results show only that file, with the match selected.
+        search_view
+            .update(cx, |search_view, window, cx| {
+                let file_results = search_view
+                    .results_tree
+                    .file_results
+                    .as_ref()
+                    .expect("one file should be shown");
+                assert_eq!(file_results.path.as_ref(), "src/one.rs");
+                let editor = file_results.editor.clone();
+                let text = editor.update(cx, |editor, cx| editor.display_text(cx));
+                assert!(text.contains("let a = TWO;\nlet b = TWO;"), "{text:?}");
+                assert!(!text.contains("const TWO"), "{text:?}");
+                assert_eq!(selected_text(&editor, cx), "TWO");
+                assert!(editor.focus_handle(cx).is_focused(window));
+            })
+            .unwrap();
+        draw(cx);
+
+        // Moving past the file's last match shows the next file.
+        search_view
+            .update(cx, |search_view, window, cx| {
+                search_view.select_match(Direction::Next, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw(cx);
+        search_view
+            .update(cx, |search_view, window, cx| {
+                let active = search_view.active_match_index.expect("a match is active");
+                assert_ne!(active, second_match_in_one_rs);
+                let file_path = search_view
+                    .results_tree
+                    .files()
+                    .iter()
+                    .find(|file| file.matches.iter().any(|m| m.index == active))
+                    .map(|file| file.path.clone())
+                    .unwrap();
+                let file_results = search_view.results_tree.file_results.as_ref().unwrap();
+                assert_ne!(file_results.path.as_ref(), "src/one.rs");
+                assert_eq!(file_results.path, file_path);
+                let editor = file_results.editor.clone();
+                assert_eq!(selected_text(&editor, cx), "TWO");
+                assert!(editor.focus_handle(cx).is_focused(window));
+            })
+            .unwrap();
+
+        // "Show All Results" goes back to every file.
+        search_view
+            .update(cx, |search_view, window, cx| {
+                search_view.show_all_results(window, cx);
+                assert!(search_view.results_tree.file_results.is_none());
+                assert!(
+                    search_view
+                        .results_editor
+                        .focus_handle(cx)
+                        .is_focused(window)
+                );
+            })
+            .unwrap();
+        draw(cx);
+
+        // Expanding the file shows its matches.
+        search_view
+            .update(cx, |search_view, _, cx| {
+                search_view.toggle_results_tree_file("src/one.rs".into(), cx);
+                let match_rows = search_view
+                    .results_tree
+                    .rows()
+                    .iter()
+                    .filter(|row| matches!(row, ResultsTreeRow::Match { .. }))
+                    .count();
+                assert_eq!(match_rows, 2);
+            })
+            .unwrap();
+        draw(cx);
+
+        // A new search with fewer results, then one with none, render fine,
+        // and show all files again.
+        search_view
+            .update(cx, |search_view, window, cx| {
+                search_view.activate_match_from_tree(second_match_in_one_rs, window, cx);
+                assert!(search_view.results_tree.file_results.is_some());
+            })
+            .unwrap();
+        perform_search(search_view, "let b", cx);
+        cx.run_until_parked();
+        draw(cx);
+        search_view
+            .update(cx, |search_view, _, cx| {
+                search_view.sync_results_tree(cx);
+                assert!(search_view.results_tree.file_results.is_none());
+                let files = search_view.results_tree.files();
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].matches.len(), 1);
+            })
+            .unwrap();
+        perform_search(search_view, "nothing matches this", cx);
+        cx.run_until_parked();
+        draw(cx);
+
+        // Toggling hides the tree.
+        perform_search(search_view, "TWO", cx);
+        cx.run_until_parked();
+        search_view
+            .update(cx, |search_view, _, cx| search_view.toggle_results_tree(cx))
+            .unwrap();
+        cx.run_until_parked();
+        draw(cx);
+        search_view
+            .update(cx, |search_view, _, _| {
+                assert!(!search_view.results_tree.visible);
+            })
+            .unwrap();
     }
 
     fn init_test(cx: &mut TestAppContext) {

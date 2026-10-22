@@ -242,8 +242,8 @@ pub enum ColumnWidthConfig {
 pub enum StaticColumnWidths {
     /// All columns share space equally (flex-1 / Length::Auto).
     Auto,
-    /// Each column has a specific width.
-    Explicit(TableRow<DefiniteLength>),
+    /// Each column has a specific width; `Length::Auto` fills the remaining space.
+    Explicit(TableRow<Length>),
 }
 
 impl ColumnWidthConfig {
@@ -278,10 +278,19 @@ impl ColumnWidthConfig {
             widths: StaticColumnWidths::Explicit(
                 widths
                     .into_iter()
-                    .map(Into::into)
+                    .map(|width| Length::Definite(width.into()))
                     .collect::<Vec<_>>()
                     .into_table_row(cols),
             ),
+            table_width: None,
+        }
+    }
+
+    /// Explicit column widths where `Length::Auto` columns fill the remaining space.
+    pub fn explicit_lengths(widths: Vec<Length>) -> Self {
+        let cols = widths.len();
+        ColumnWidthConfig::Static {
+            widths: StaticColumnWidths::Explicit(widths.into_table_row(cols)),
             table_width: None,
         }
     }
@@ -296,7 +305,7 @@ impl ColumnWidthConfig {
             ColumnWidthConfig::Static {
                 widths: StaticColumnWidths::Explicit(widths),
                 ..
-            } => Some(widths.map_cloned(Length::Definite)),
+            } => Some(widths.clone()),
             ColumnWidthConfig::Redistributable {
                 columns_state: entity,
                 ..
@@ -563,11 +572,17 @@ fn is_pinned_layout(pinned_cols: usize, cols: usize) -> bool {
     pinned_cols > 0 && pinned_cols < cols
 }
 
+/// Returns `true` when a cell with `width` should take the remaining space.
+fn fills_remaining_width(width: Option<Length>) -> bool {
+    matches!(width, None | Some(Length::Auto))
+}
+
 fn base_cell_style(width: Option<Length>) -> Div {
+    let fill = fills_remaining_width(width);
     div()
         .px_1p5()
-        .when_some(width, |this, width| this.w(width))
-        .when(width.is_none(), |this| this.flex_1())
+        .when_some(width.filter(|_| !fill), |this, width| this.w(width))
+        .when(fill, |this| this.flex_1())
         .whitespace_nowrap()
         .text_ellipsis()
         .overflow_hidden()
@@ -579,9 +594,10 @@ fn base_cell_style_text(width: Option<Length>, use_ui_font: bool, cx: &App) -> D
 
 fn render_cell(width: Option<Length>, cell: AnyElement, ctx: &TableRenderContext, cx: &App) -> Div {
     if ctx.disable_base_cell_style {
+        let fill = fills_remaining_width(width);
         div()
-            .when_some(width, |this, width| this.w(width))
-            .when(width.is_none(), |this| this.flex_1())
+            .when_some(width.filter(|_| !fill), |this, width| this.w(width))
+            .when(fill, |this| this.flex_1())
             .overflow_hidden()
             .child(cell)
     } else {

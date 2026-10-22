@@ -3,7 +3,8 @@ use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
-    SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    SelectionEffects, SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    scroll::Autoscroll,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, RepoPath};
@@ -19,14 +20,14 @@ use gpui::{
     Window, actions,
 };
 use language::{
-    Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
-    ReplicaId, Rope, TextBuffer,
+    Bias, Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
+    Point, ReplicaId, Rope, TextBuffer,
 };
 use markdown::{Markdown, MarkdownElement};
 use multi_buffer::PathKey;
 use project::{
     Project, ProjectPath, WorktreeId,
-    git_store::{CommitDiff, Repository, UnshallowState},
+    git_store::{CommitDiff, CommitFile, Repository, UnshallowState},
 };
 use settings::{DiffViewStyle, Settings};
 use std::{
@@ -144,23 +145,10 @@ impl Addon for CommitDiffAddon {
         _window: &mut Window,
         cx: &mut App,
     ) -> ContextMenu {
-        let file_to_open = buffer.file().and_then(|file| {
-            let commit_view = self.commit_view.upgrade()?;
-            let commit_view = commit_view.read(cx);
-            let project_path = commit_view
-                .repository
-                .read(cx)
-                .repo_path_to_project_path(&RepoPath::from_rel_path(file.path()), cx)?;
-            let exists_at_head = commit_view
-                .workspace
-                .upgrade()?
-                .read(cx)
-                .project()
-                .read(cx)
-                .entry_for_path(&project_path, cx)
-                .is_some();
-            exists_at_head.then(|| file.clone())
-        });
+        let file_to_open = buffer
+            .file()
+            .filter(|file| self.exists_at_head(file, cx))
+            .cloned();
 
         menu.when_some(file_to_open, |menu, file| {
             let commit_view = self.commit_view.clone();
@@ -169,11 +157,61 @@ impl Addon for CommitDiffAddon {
                 Some(Box::new(OpenFileAtHead)),
                 move |window, cx| {
                     commit_view
-                        .update(cx, |view, cx| view.open_file_at_head(&file, window, cx))
+                        .update(cx, |view, cx| {
+                            view.open_file_at_head(&file, None, window, cx)
+                        })
                         .log_err();
                 },
             )
         })
+    }
+
+    fn open_buffer(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: Point,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(file) = buffer
+            .read(cx)
+            .file()
+            .filter(|file| self.exists_at_head(file, cx))
+            .cloned()
+        else {
+            return false;
+        };
+        let commit_view = self.commit_view.clone();
+        // Opening activates another pane item, which calls back into the commit view and its
+        // editor while they may still be on the stack.
+        window.defer(cx, move |window, cx| {
+            commit_view
+                .update(cx, |view, cx| {
+                    view.open_file_at_head(&file, Some(position), window, cx)
+                })
+                .log_err();
+        });
+        true
+    }
+}
+
+impl CommitDiffAddon {
+    fn exists_at_head(&self, file: &Arc<dyn File>, cx: &App) -> bool {
+        let Some(commit_view) = self.commit_view.upgrade() else {
+            return false;
+        };
+        let commit_view = commit_view.read(cx);
+        commit_view
+            .repository
+            .read(cx)
+            .repo_path_to_project_path(&RepoPath::from_rel_path(file.path()), cx)
+            .is_some_and(|project_path| {
+                commit_view
+                    .project
+                    .read(cx)
+                    .entry_for_path(&project_path, cx)
+                    .is_some()
+            })
     }
 }
 
@@ -346,48 +384,21 @@ impl CommitView {
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
 
             for file in commit_diff.files {
-                let is_created = file.old_text.is_none();
-                let is_deleted = file.new_text.is_none();
-                let raw_new_text = file.new_text.unwrap_or_default();
-                let raw_old_text = file.old_text;
-
-                let is_binary = file.is_binary;
-
-                let new_text = if is_binary {
-                    "(binary file not shown)".to_string()
-                } else {
-                    raw_new_text
-                };
-                let old_text = if is_binary { None } else { raw_old_text };
-                let worktree_id = repository_clone
-                    .read_with(cx, |repository, cx| {
-                        worktree_id_for_repo_path(
-                            repository,
-                            project_clone.read(cx),
-                            &file.path,
-                            cx,
-                        )
-                    })
-                    .context("project has no worktrees")?;
-                let short_sha = commit_sha
-                    .get(0..git::SHORT_SHA_LENGTH)
-                    .unwrap_or(&commit_sha);
-                let file_name = file
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string())
-                    .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
-                let display_name = format!("{short_sha} - {file_name}");
-
-                let file = Arc::new(GitBlob {
-                    path: file.path.clone(),
+                let CommitFileBuffer {
+                    buffer,
+                    buffer_diff,
+                    is_created,
                     is_deleted,
                     is_binary,
-                    worktree_id,
-                    display_name,
-                }) as Arc<dyn language::File>;
-
-                let buffer = build_buffer(new_text, file, &language_registry, cx).await?;
+                } = build_commit_file_buffer(
+                    file,
+                    &commit_sha,
+                    &repository_clone,
+                    &project_clone,
+                    &language_registry,
+                    cx,
+                )
+                .await?;
                 let buffer_id = cx.update(|_, cx| buffer.read(cx).remote_id())?;
 
                 let status_code = if is_created {
@@ -408,22 +419,6 @@ impl CommitView {
                 if is_binary {
                     binary_buffer_ids.insert(buffer_id);
                 }
-
-                let buffer_diff = if is_binary {
-                    cx.update(|_, cx| {
-                        let snapshot = buffer.read(cx).snapshot();
-                        cx.new(|cx| {
-                            BufferDiff::new_unchanged(
-                                &snapshot,
-                                snapshot.language().cloned(),
-                                Some(language_registry.clone()),
-                                cx,
-                            )
-                        })
-                    })?
-                } else {
-                    build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
-                };
 
                 let (excerpt_ranges, path) = cx.update(|_, cx| {
                     let snapshot = buffer.read(cx).snapshot();
@@ -663,6 +658,7 @@ impl CommitView {
     fn open_file_at_head(
         &mut self,
         file: &Arc<dyn language::File>,
+        position: Option<Point>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -678,13 +674,37 @@ impl CommitView {
                 path: rel_path,
             });
 
-        self.workspace
+        let Some(open_task) = self
+            .workspace
             .update(cx, |workspace, cx| {
-                workspace
-                    .open_path_preview(project_path, None, false, false, true, window, cx)
-                    .detach_and_log_err(cx);
+                workspace.open_path_preview(project_path, None, true, false, true, window, cx)
             })
-            .log_err();
+            .log_err()
+        else {
+            return;
+        };
+        cx.spawn_in(window, async move |_, cx| {
+            let item = open_task.await?;
+            if let Some(position) = position
+                && let Some(editor) = item.downcast::<Editor>()
+            {
+                editor.update_in(cx, |editor, window, cx| {
+                    let position = editor
+                        .buffer()
+                        .read(cx)
+                        .snapshot(cx)
+                        .clip_point(position, Bias::Left);
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::center()),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([position..position]),
+                    );
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn open_file_at_head_action(
@@ -703,7 +723,7 @@ impl CommitView {
         else {
             return;
         };
-        self.open_file_at_head(&file, window, cx);
+        self.open_file_at_head(&file, None, window, cx);
     }
 
     fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1146,6 +1166,87 @@ pub(crate) async fn build_buffer(
     Ok(buffer)
 }
 
+/// A file changed by a commit: a read-only buffer with its content after the
+/// commit, diffed against its content before it.
+pub(crate) struct CommitFileBuffer {
+    pub buffer: Entity<Buffer>,
+    pub buffer_diff: Entity<BufferDiff>,
+    pub is_created: bool,
+    pub is_deleted: bool,
+    pub is_binary: bool,
+}
+
+pub(crate) async fn build_commit_file_buffer(
+    file: CommitFile,
+    commit_sha: &str,
+    repository: &Entity<Repository>,
+    project: &Entity<Project>,
+    language_registry: &Arc<LanguageRegistry>,
+    cx: &mut AsyncWindowContext,
+) -> Result<CommitFileBuffer> {
+    let is_created = file.old_text.is_none();
+    let is_deleted = file.new_text.is_none();
+    let raw_new_text = file.new_text.unwrap_or_default();
+    let raw_old_text = file.old_text;
+
+    let is_binary = file.is_binary;
+
+    let new_text = if is_binary {
+        "(binary file not shown)".to_string()
+    } else {
+        raw_new_text
+    };
+    let old_text = if is_binary { None } else { raw_old_text };
+    let worktree_id = repository
+        .read_with(cx, |repository, cx| {
+            worktree_id_for_repo_path(repository, project.read(cx), &file.path, cx)
+        })
+        .context("project has no worktrees")?;
+    let short_sha = commit_sha
+        .get(0..git::SHORT_SHA_LENGTH)
+        .unwrap_or(commit_sha);
+    let file_name = file
+        .path
+        .file_name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
+    let display_name = format!("{short_sha} - {file_name}");
+
+    let file = Arc::new(GitBlob {
+        path: file.path.clone(),
+        is_deleted,
+        is_binary,
+        worktree_id,
+        display_name,
+    }) as Arc<dyn language::File>;
+
+    let buffer = build_buffer(new_text, file, language_registry, cx).await?;
+
+    let buffer_diff = if is_binary {
+        cx.update(|_, cx| {
+            let snapshot = buffer.read(cx).snapshot();
+            cx.new(|cx| {
+                BufferDiff::new_unchanged(
+                    &snapshot,
+                    snapshot.language().cloned(),
+                    Some(language_registry.clone()),
+                    cx,
+                )
+            })
+        })?
+    } else {
+        build_buffer_diff(old_text, &buffer, language_registry, cx).await?
+    };
+
+    Ok(CommitFileBuffer {
+        buffer,
+        buffer_diff,
+        is_created,
+        is_deleted,
+        is_binary,
+    })
+}
+
 async fn build_buffer_diff(
     mut old_text: Option<String>,
     buffer: &Entity<Buffer>,
@@ -1538,6 +1639,89 @@ mod tests {
     use indoc::indoc;
     use language::{Language, LanguageConfig, LanguageMatcher, markdown_lang};
     use settings::SettingsStore;
+
+    #[gpui::test]
+    async fn test_opening_a_file_from_the_commit_view_opens_the_project_file(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+
+        let sha = "1111111111111111111111111111111111111111";
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            std::path::Path::new("/project"),
+            serde_json::json!({ ".git": {}, "lib.rs": "one\nTWO\nthree\n" }),
+        )
+        .await;
+        fs.set_commit_diff(
+            std::path::Path::new("/project/.git"),
+            sha,
+            vec![(
+                RepoPath::new("lib.rs").unwrap(),
+                Some("one\ntwo\nthree\n".to_string()),
+                Some("one\nTWO\nthree\n".to_string()),
+            )],
+        );
+        let project = Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            CommitView::open(
+                sha.to_string(),
+                repository.downgrade(),
+                workspace.weak_handle(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let commit_view = workspace.read_with(&*cx, |workspace, cx| {
+            workspace
+                .active_item_as::<CommitView>(cx)
+                .expect("the commit view should be open")
+        });
+        let rhs_editor =
+            commit_view.read_with(&*cx, |view, cx| view.editor.read(cx).rhs_editor().clone());
+        rhs_editor.update_in(cx, |editor, window, cx| {
+            editor.open_excerpts(&editor::actions::OpenExcerpts, window, cx);
+        });
+        cx.run_until_parked();
+
+        let editor = workspace.read_with(&*cx, |workspace, cx| {
+            workspace
+                .active_item_as::<Editor>(cx)
+                .expect("the file should open in an editor")
+        });
+        editor.read_with(&*cx, |editor, cx| {
+            assert!(!editor.read_only(cx));
+            let multibuffer = editor.buffer().read(cx);
+            let buffer = multibuffer.as_singleton().expect("a single file");
+            assert!(
+                project::File::from_dyn(buffer.read(cx).file()).is_some(),
+                "the working tree's version of the file"
+            );
+            assert_eq!(multibuffer.snapshot(cx).text(), "one\nTWO\nthree\n");
+        });
+    }
 
     #[gpui::test]
     async fn test_build_buffer_resolves_injected_languages(cx: &mut TestAppContext) {

@@ -104,6 +104,8 @@ pub struct RedistributableColumnsState {
     pub(crate) preview_widths: TableRow<DefiniteLength>,
     pub(crate) resize_behavior: TableRow<TableResizeBehavior>,
     pub(crate) cached_container_width: Pixels,
+    /// The column that takes the space the other columns leave, if any.
+    pub(crate) fill_column: Option<usize>,
 }
 
 impl RedistributableColumnsState {
@@ -123,6 +125,7 @@ impl RedistributableColumnsState {
             preview_widths: widths,
             resize_behavior: resize_behavior.into_table_row(cols),
             cached_container_width: Default::default(),
+            fill_column: None,
         }
     }
 
@@ -142,12 +145,26 @@ impl RedistributableColumnsState {
         &self.resize_behavior
     }
 
+    pub fn fill_column(&self) -> Option<usize> {
+        self.fill_column
+    }
+
+    /// Makes `column_index` take the space the other columns leave, so columns
+    /// with absolute widths keep their size when the container resizes.
+    pub fn set_fill_column(&mut self, column_index: Option<usize>) {
+        self.fill_column = column_index.filter(|index| *index < self.cols());
+    }
+
     pub fn widths_to_render(&self) -> TableRow<Length> {
-        self.preview_widths.map_cloned(Length::Definite)
+        let mut widths = self.preview_widths.map_cloned(Length::Definite);
+        if let Some(fill_column) = self.fill_column {
+            widths[fill_column] = Length::Auto;
+        }
+        widths
     }
 
     pub fn preview_fractions(&self, rem_size: Pixels) -> TableRow<f32> {
-        if self.cached_container_width > px(0.) {
+        let mut fractions = if self.cached_container_width > px(0.) {
             self.preview_widths
                 .map_ref(|length| Self::get_fraction(length, self.cached_container_width, rem_size))
         } else {
@@ -155,7 +172,54 @@ impl RedistributableColumnsState {
                 DefiniteLength::Fraction(fraction) => *fraction,
                 DefiniteLength::Absolute(_) => 0.0,
             })
+        };
+        if let Some(fill_column) = self.fill_column {
+            Self::fill_remaining_fraction(&mut fractions, fill_column, None);
         }
+        fractions
+    }
+
+    /// Returns the fraction of the container each column takes on screen: the
+    /// hidden columns' width goes to the visible columns, as in
+    /// [`redistribute_hidden_widths`], and the fill column takes the rest.
+    /// Hidden columns keep their stored fraction.
+    pub fn rendered_fractions(
+        &self,
+        hidden: Option<&TableRow<bool>>,
+        rem_size: Pixels,
+    ) -> TableRow<f32> {
+        let Some(fill_column) = self.fill_column else {
+            return redistribute_hidden_fractions(&self.preview_fractions(rem_size), hidden);
+        };
+        let bounds_width = self.cached_container_width;
+        let mut fractions =
+            redistribute_hidden_widths(&self.widths_to_render(), hidden).map_ref(|length| {
+                match length {
+                    Length::Definite(DefiniteLength::Fraction(fraction)) => *fraction,
+                    Length::Definite(length) if bounds_width > px(0.) => {
+                        Self::get_fraction(length, bounds_width, rem_size)
+                    }
+                    _ => 0.0,
+                }
+            });
+        Self::fill_remaining_fraction(&mut fractions, fill_column, hidden);
+        fractions
+    }
+
+    /// Sets the fill column's fraction to what the other visible columns leave.
+    fn fill_remaining_fraction(
+        fractions: &mut TableRow<f32>,
+        fill_column: usize,
+        hidden: Option<&TableRow<bool>>,
+    ) {
+        let others: f32 = fractions
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != fill_column && !is_column_hidden(hidden, *idx))
+            .map(|(_, fraction)| *fraction)
+            .sum();
+        fractions[fill_column] = (1.0 - others).max(0.0);
     }
 
     pub fn preview_column_width(&self, column_index: usize, window: &Window) -> Option<Pixels> {
@@ -165,6 +229,7 @@ impl RedistributableColumnsState {
                 Some(self.cached_container_width * *fraction)
             }
             DefiniteLength::Fraction(_) => None,
+            _ if self.fill_column == Some(column_index) => None,
             DefiniteLength::Absolute(AbsoluteLength::Pixels(pixels)) => Some(*pixels),
             DefiniteLength::Absolute(AbsoluteLength::Rems(rems_width)) => {
                 Some(rems_width.to_pixels(window.rem_size()))
@@ -180,8 +245,37 @@ impl RedistributableColumnsState {
         self.cached_container_width = width;
     }
 
+    /// Replaces the committed and preview widths, e.g. to size a column to its content.
+    pub fn set_widths(&mut self, widths: TableRow<DefiniteLength>) {
+        self.committed_widths = widths.clone();
+        self.preview_widths = widths;
+    }
+
     pub fn commit_preview(&mut self) {
+        self.preview_widths = self.keep_absolute_widths(self.preview_widths.clone());
         self.committed_widths = self.preview_widths.clone();
+    }
+
+    /// With a fill column, turns `widths` back into pixels for the columns
+    /// whose committed width is absolute, so they still don't change size when
+    /// the container resizes.
+    fn keep_absolute_widths(
+        &self,
+        mut widths: TableRow<DefiniteLength>,
+    ) -> TableRow<DefiniteLength> {
+        let container_width = self.cached_container_width;
+        if self.fill_column.is_none() || container_width <= px(0.) {
+            return widths;
+        }
+        for idx in 0..widths.cols() {
+            if let (DefiniteLength::Absolute(_), DefiniteLength::Fraction(fraction)) =
+                (self.committed_widths[idx], widths[idx])
+            {
+                widths[idx] =
+                    DefiniteLength::Absolute(AbsoluteLength::Pixels(container_width * fraction));
+            }
+        }
+        widths
     }
 
     pub fn reset_column_to_initial_width(&mut self, column_index: usize, window: &Window) {
@@ -194,13 +288,17 @@ impl RedistributableColumnsState {
         let initial_sizes = self
             .initial_widths
             .map_ref(|length| Self::get_fraction(length, bounds_width, rem_size));
-        let widths = self
+        let mut widths = self
             .committed_widths
             .map_ref(|length| Self::get_fraction(length, bounds_width, rem_size));
+        if let Some(fill_column) = self.fill_column {
+            Self::fill_remaining_fraction(&mut widths, fill_column, None);
+        }
 
         let updated_widths =
             Self::reset_to_initial_size(column_index, widths, initial_sizes, &self.resize_behavior);
-        self.committed_widths = updated_widths.map(DefiniteLength::Fraction);
+        self.committed_widths =
+            self.keep_absolute_widths(updated_widths.map(DefiniteLength::Fraction));
         self.preview_widths = self.committed_widths.clone();
     }
 
@@ -287,9 +385,19 @@ impl RedistributableColumnsState {
             rem_size,
         );
 
-        let widths = self
+        let mut widths = self
             .committed_widths
             .map_ref(|length| Self::get_fraction(length, bounds_width, rem_size));
+        if let Some(fill_column) = self.fill_column {
+            // Absolute widths aren't scaled up for hidden columns, so drop the
+            // hidden columns instead and let the fill column take the rest.
+            for idx in 0..widths.cols() {
+                if is_column_hidden(hidden, idx) {
+                    widths[idx] = 0.0;
+                }
+            }
+            Self::fill_remaining_fraction(&mut widths, fill_column, hidden);
+        }
 
         let drag_fraction = (drag_position.x - bounds.left()) / bounds_width;
 
@@ -302,7 +410,15 @@ impl RedistributableColumnsState {
             divider_width,
         );
 
-        self.preview_widths = widths.map(DefiniteLength::Fraction);
+        let mut preview_widths = widths.map(DefiniteLength::Fraction);
+        if self.fill_column.is_some() {
+            for idx in 0..preview_widths.cols() {
+                if is_column_hidden(hidden, idx) {
+                    preview_widths[idx] = self.committed_widths[idx];
+                }
+            }
+        }
+        self.preview_widths = preview_widths;
     }
 
     /// Computes the preview column fractions produced by dragging the divider after `col_idx`
@@ -571,8 +687,12 @@ pub fn bind_redistributable_columns(
             let columns_state = columns_state.clone();
             move |bounds, _, cx| {
                 if let Some(width) = child_bounds_width(&bounds) {
-                    columns_state.update(cx, |columns, _| {
-                        columns.set_cached_container_width(width);
+                    columns_state.update(cx, |columns, cx| {
+                        if columns.cached_container_width != width {
+                            columns.set_cached_container_width(width);
+                            // Lets observers re-layout with the new width right away.
+                            cx.notify();
+                        }
                     });
                 }
             }
@@ -731,7 +851,10 @@ pub(crate) fn render_column_resize_divider(
 }
 
 fn resize_spacer(width: Length) -> Div {
-    div().w(width).h_full()
+    match width {
+        Length::Auto => div().flex_1().h_full(),
+        width => div().w(width).h_full(),
+    }
 }
 
 fn child_bounds_width(bounds: &[Bounds<Pixels>]) -> Option<Pixels> {

@@ -1193,6 +1193,35 @@ impl ContextMenu {
         cx.emit(DismissEvent);
     }
 
+    /// The labels of the menu's entries, in order.
+    pub fn entry_labels(&self) -> Vec<SharedString> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                ContextMenuItem::Entry(entry) => Some(entry.label.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Selects the entry labeled `label` and confirms it, as if it were
+    /// clicked. Returns whether there is such an entry.
+    pub fn confirm_entry_with_label(
+        &mut self,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(ix) = self.items.iter().position(
+            |item| matches!(item, ContextMenuItem::Entry(entry) if entry.label.as_ref() == label),
+        ) else {
+            return false;
+        };
+        self.select_index(ix, window, cx);
+        self.confirm(&menu::Confirm, window, cx);
+        true
+    }
+
     fn select_index(
         &mut self,
         ix: usize,

@@ -809,6 +809,18 @@ pub trait Addon: 'static {
         None
     }
 
+    /// Opens the buffer in place of the editor's default "open excerpt" behavior,
+    /// returning whether it was handled.
+    fn open_buffer(
+        &self,
+        _: &Entity<language::Buffer>,
+        _: Point,
+        _: &mut Window,
+        _: &mut App,
+    ) -> bool {
+        false
+    }
+
     fn to_any(&self) -> &dyn std::any::Any;
 
     fn to_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -1172,6 +1184,8 @@ pub struct Editor {
     hovered_diff_hunk_row: Option<DisplayRow>,
     pull_diagnostics_task: Task<()>,
     in_project_search: bool,
+    /// Whether file headers can fold their file, with their chevron or a click.
+    pub(crate) buffer_header_folding: bool,
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
     breadcrumb_header: Option<String>,
     focused_block: Option<FocusedBlock>,
@@ -2563,6 +2577,7 @@ impl Editor {
             post_scroll_update: Task::ready(()),
             linked_edit_ranges: Default::default(),
             in_project_search: false,
+            buffer_header_folding: true,
             previous_search_ranges: None,
             breadcrumb_header: None,
             focused_block: None,
@@ -3213,6 +3228,12 @@ impl Editor {
 
     pub fn set_in_project_search(&mut self, in_project_search: bool) {
         self.in_project_search = in_project_search;
+    }
+
+    /// Sets whether file headers can fold their file, with their chevron or a
+    /// click. Without folding, the headers are plain titles.
+    pub fn set_buffer_header_folding(&mut self, buffer_header_folding: bool) {
+        self.buffer_header_folding = buffer_header_folding;
     }
 
     pub fn set_search_results_status(
@@ -10650,6 +10671,8 @@ impl Editor {
         new_selections_by_buffer
             .retain(|buffer, _| buffer.read(cx).file().is_none_or(|file| file.can_open()));
 
+        self.open_buffers_via_addons(&mut new_selections_by_buffer, window, cx);
+
         if new_selections_by_buffer.is_empty() {
             return;
         }
@@ -10657,10 +10680,32 @@ impl Editor {
         Self::open_buffers_in_workspace(
             workspace.downgrade(),
             new_selections_by_buffer,
+            self.buffer.clone(),
             split,
             window,
             cx,
         );
+    }
+
+    pub(crate) fn open_buffers_via_addons(
+        &self,
+        new_selections_by_buffer: &mut HashMap<
+            Entity<language::Buffer>,
+            (Vec<Range<BufferOffset>>, Option<u32>),
+        >,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        new_selections_by_buffer.retain(|buffer, (ranges, _)| {
+            let position = ranges
+                .first()
+                .map(|range| buffer.read(cx).offset_to_point(range.start.0))
+                .unwrap_or_default();
+            !self
+                .addons
+                .values()
+                .any(|addon| addon.open_buffer(buffer, position, window, cx))
+        });
     }
 
     pub(crate) fn open_buffers_in_workspace(
@@ -10669,6 +10714,7 @@ impl Editor {
             Entity<language::Buffer>,
             (Vec<Range<BufferOffset>>, Option<u32>),
         >,
+        source_multibuffer: Entity<MultiBuffer>,
         split: bool,
         window: &mut Window,
         cx: &mut App,
@@ -10692,6 +10738,16 @@ impl Editor {
                         } else {
                             (false, false)
                         };
+
+                        // A historic file (e.g. from a commit) keeps showing the diff it was
+                        // opened from, with every hunk expanded.
+                        let historic_diff = (has_file && !is_project_file)
+                            .then(|| {
+                                source_multibuffer
+                                    .read(cx)
+                                    .diff_for(buffer.read(cx).remote_id())
+                            })
+                            .flatten();
 
                         // If project file is none workspace.open_project_item will fail to open the excerpt
                         // in a pre existing workspace item if one exists, because Buffer entity_id will be None
@@ -10743,6 +10799,14 @@ impl Editor {
                         editor.update(cx, |editor, cx| {
                             if has_file && !is_project_file {
                                 editor.set_read_only(true);
+                            }
+                            if let Some(diff) = historic_diff {
+                                editor.buffer().update(cx, |multibuffer, cx| {
+                                    if multibuffer.diff_for(diff.read(cx).buffer_id).is_none() {
+                                        multibuffer.add_diff(diff, cx);
+                                        multibuffer.set_all_diff_hunks_expanded(cx);
+                                    }
+                                });
                             }
                             let autoscroll = match scroll_offset {
                                 Some(scroll_offset) => {
