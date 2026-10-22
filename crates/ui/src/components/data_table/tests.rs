@@ -655,3 +655,98 @@ mod column_filter {
         );
     }
 }
+
+mod fill_column {
+    use super::*;
+    use gpui::{DefiniteLength, Length};
+
+    fn pixels(width: f32) -> DefiniteLength {
+        DefiniteLength::Absolute(AbsoluteLength::Pixels(px(width)))
+    }
+
+    /// Graph 100px, Description fills, Date 60px, Commit 40px.
+    fn state(container_width: f32) -> RedistributableColumnsState {
+        let mut state = RedistributableColumnsState::new(
+            4,
+            vec![
+                pixels(100.),
+                DefiniteLength::Fraction(0.5),
+                pixels(60.),
+                pixels(40.),
+            ],
+            vec![TableResizeBehavior::Resizable; 4],
+        );
+        state.set_fill_column(Some(1));
+        state.set_cached_container_width(px(container_width));
+        state
+    }
+
+    #[test]
+    fn fill_column_renders_as_auto() {
+        let widths = state(400.).widths_to_render();
+        assert!(widths[1] == Length::Auto);
+        assert!(widths[0] == Length::Definite(pixels(100.)));
+    }
+
+    #[test]
+    fn fill_column_takes_the_remaining_space() {
+        let rem_size = px(16.);
+        let narrow = state(400.).rendered_fractions(None, rem_size);
+        assert!(is_almost_eq(narrow.as_slice(), &[0.25, 0.5, 0.15, 0.1]));
+
+        // Only the fill column grows with the container.
+        let wide = state(800.).rendered_fractions(None, rem_size);
+        assert!(is_almost_eq(wide.as_slice(), &[0.125, 0.75, 0.075, 0.05]));
+    }
+
+    #[test]
+    fn fill_column_takes_the_space_of_hidden_columns() {
+        let hidden = TableRow::from_vec(vec![false, false, false, true], 4);
+        let fractions = state(400.).rendered_fractions(Some(&hidden), px(16.));
+        assert!(is_almost_eq(&fractions.as_slice()[..3], &[0.25, 0.6, 0.15]));
+    }
+
+    #[test]
+    fn fill_column_never_goes_negative() {
+        let fractions = state(150.).rendered_fractions(None, px(16.));
+        assert_eq!(fractions[1], 0.0);
+    }
+
+    #[test]
+    fn committing_a_drag_keeps_absolute_columns_in_pixels() {
+        let mut state = state(400.);
+        state.preview_widths = TableRow::from_vec(
+            vec![
+                DefiniteLength::Fraction(0.3),
+                DefiniteLength::Fraction(0.45),
+                DefiniteLength::Fraction(0.15),
+                DefiniteLength::Fraction(0.1),
+            ],
+            4,
+        );
+        state.commit_preview();
+        let widths = state.preview_widths().as_slice().to_vec();
+        let assert_pixels = |width: DefiniteLength, expected: f32| {
+            let DefiniteLength::Absolute(AbsoluteLength::Pixels(width)) = width else {
+                panic!("column should stay in pixels, got {width:?}");
+            };
+            assert!(
+                (width - px(expected)).abs() < px(1e-3),
+                "{width:?} != {expected}"
+            );
+        };
+        assert_pixels(widths[0], 120.);
+        assert!(widths[1] == DefiniteLength::Fraction(0.45));
+        assert_pixels(widths[2], 60.);
+        assert_pixels(widths[3], 40.);
+        assert!(state.committed_widths.as_slice() == widths.as_slice());
+    }
+
+    #[test]
+    fn out_of_range_fill_column_is_ignored() {
+        let mut state = state(400.);
+        state.set_fill_column(Some(4));
+        assert_eq!(state.fill_column(), None);
+        assert!(state.widths_to_render()[1] == Length::Definite(DefiniteLength::Fraction(0.5)));
+    }
+}

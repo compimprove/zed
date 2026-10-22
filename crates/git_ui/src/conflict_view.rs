@@ -28,7 +28,7 @@ pub(crate) struct ConflictAddon {
 }
 
 struct BufferConflicts {
-    block_ids: Vec<(Range<Anchor>, CustomBlockId)>,
+    block_ids: Vec<(Range<Anchor>, Option<CustomBlockId>)>,
     conflict_set: Entity<ConflictSet>,
     _subscription: Subscription,
 }
@@ -153,7 +153,12 @@ pub(crate) fn buffers_removed(
     };
     conflict_addon.buffers.retain(|buffer_id, buffer| {
         if removed_buffer_ids.contains(buffer_id) {
-            removed_block_ids.extend(buffer.block_ids.iter().map(|(_, block_id)| *block_id));
+            removed_block_ids.extend(
+                buffer
+                    .block_ids
+                    .iter()
+                    .filter_map(|(_, block_id)| *block_id),
+            );
             false
         } else {
             true
@@ -217,7 +222,7 @@ fn conflicts_updated(
                 continue;
             };
             removed_highlighted_ranges.push(range.clone());
-            removed_block_ids.insert(block_id);
+            removed_block_ids.extend(block_id);
         }
 
         editor.remove_gutter_highlights::<ConflictsOuter>(removed_highlighted_ranges.clone(), cx);
@@ -248,6 +253,7 @@ fn conflicts_updated(
         }))
         .into_iter();
     let mut blocks = Vec::new();
+    let mut has_block = Vec::with_capacity(new_conflicts.len());
     for conflict in new_conflicts {
         let block_anchor = converted_ranges.next().flatten().map(|range| range.start);
         let outer = converted_ranges.next().flatten();
@@ -257,6 +263,7 @@ fn conflicts_updated(
             update_conflict_highlighting(editor, conflict, outer, ours, theirs, cx);
         }
 
+        has_block.push(block_anchor.is_some());
         if let Some(anchor) = block_anchor {
             let editor_handle = editor_handle.clone();
             blocks.push(BlockProperties {
@@ -271,7 +278,7 @@ fn conflicts_updated(
             })
         }
     }
-    let new_block_ids = editor.insert_blocks(blocks, None, cx);
+    let mut new_block_ids = editor.insert_blocks(blocks, None, cx).into_iter();
 
     let Some(conflict_addon) = editor.addon_mut::<ConflictAddon>() else {
         return;
@@ -283,8 +290,15 @@ fn conflicts_updated(
             old_range,
             new_conflicts
                 .iter()
-                .map(|conflict| conflict.range.clone())
-                .zip(new_block_ids),
+                .zip(has_block)
+                .map(|(conflict, has_block)| {
+                    let block_id = if has_block {
+                        new_block_ids.next()
+                    } else {
+                        None
+                    };
+                    (conflict.range.clone(), block_id)
+                }),
         );
     }
 }
@@ -521,7 +535,7 @@ pub(crate) fn resolve_conflict(
                 editor.remove_highlighted_rows::<ConflictsTheirs>(vec![range.clone()], cx);
                 editor.remove_highlighted_rows::<ConflictsOursMarker>(vec![range.clone()], cx);
                 editor.remove_highlighted_rows::<ConflictsTheirsMarker>(vec![range], cx);
-                editor.remove_blocks(HashSet::from_iter([block_id]), None, cx);
+                editor.remove_blocks(HashSet::from_iter(block_id), None, cx);
                 Some(())
             })
             .ok();

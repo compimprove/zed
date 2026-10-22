@@ -111,6 +111,9 @@ actions!(
         Fetch,
         /// Fetches changes from a specific remote.
         FetchFrom,
+        /// Removes the remote-tracking branches of `origin` whose branches
+        /// were deleted on `origin`.
+        PruneOrigin,
         /// Creates a new commit with staged changes.
         Commit,
         /// Runs the next commit with `git commit --no-verify`.

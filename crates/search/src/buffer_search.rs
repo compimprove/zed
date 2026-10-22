@@ -3999,6 +3999,7 @@ mod tests {
                 regex: false,
                 center_on_match: false,
                 search_on_type: false,
+                results_tree: true,
             },
             cx,
         );
@@ -4063,6 +4064,7 @@ mod tests {
                 regex: false,
                 center_on_match: false,
                 search_on_type: false,
+                results_tree: true,
             },
             cx,
         );
@@ -4102,6 +4104,7 @@ mod tests {
                 regex: false,
                 center_on_match: false,
                 search_on_type: false,
+                results_tree: true,
             },
             cx,
         );
@@ -4632,6 +4635,7 @@ mod tests {
                         regex: Some(search_settings.regex),
                         center_on_match: Some(search_settings.center_on_match),
                         search_on_type: Some(search_settings.search_on_type),
+                        results_tree: Some(search_settings.results_tree),
                     });
                 });
             });

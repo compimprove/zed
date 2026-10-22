@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Builds a release of this fork and installs it as "Zed Local.app" in
+# ~/Applications, next to (and independent of) the official Zed.
+#
+# Usage: script/install-zed-local [--skip-build]
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+app_name="Zed Local"
+bundle_id="dev.zed.Zed-Local"
+install_dir="$HOME/Applications"
+app_path="$install_dir/$app_name.app"
+resources="crates/zed/resources"
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n 1)
+
+if [[ "${1:-}" != "--skip-build" ]]; then
+    cargo build --release --package zed --package cli
+fi
+
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+contents="$staging/$app_name.app/Contents"
+mkdir -p "$contents/MacOS" "$contents/Resources"
+
+cp target/release/zed "$contents/MacOS/zed"
+cp target/release/cli "$contents/MacOS/cli"
+cp "$resources/Document.icns" "$contents/Resources/Document.icns"
+cp "$resources/zed.entitlements" "$contents/Resources/zed.entitlements"
+
+# App icon: the "Dev" artwork, so it's easy to tell apart from the official Zed.
+iconset="$staging/AppIcon.iconset"
+mkdir -p "$iconset"
+for size in 16 32 128 256 512; do
+    sips -z $size $size "$resources/app-icon-dev@2x.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    sips -z $((size * 2)) $((size * 2)) "$resources/app-icon-dev@2x.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$iconset" -o "$contents/Resources/AppIcon.icns"
+
+cat > "$contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>English</string>
+    <key>CFBundleDisplayName</key>
+    <string>$app_name</string>
+    <key>CFBundleName</key>
+    <string>$app_name</string>
+    <key>CFBundleExecutable</key>
+    <string>zed</string>
+    <key>CFBundleIdentifier</key>
+    <string>$bundle_id</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$version</string>
+    <key>CFBundleVersion</key>
+    <string>$version</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15.7</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+$(cat "$resources"/info/*.plist)
+</dict>
+</plist>
+EOF
+plutil -lint "$contents/Info.plist" >/dev/null
+
+codesign --force --deep --entitlements "$resources/zed.entitlements" --sign - "$staging/$app_name.app"
+
+mkdir -p "$install_dir"
+rm -rf "$app_path"
+mv "$staging/$app_name.app" "$app_path"
+echo "Installed $app_path ($version)"

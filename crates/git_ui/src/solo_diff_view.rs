@@ -185,7 +185,7 @@ impl SoloDiffView {
         }
     }
 
-    fn build_multibuffer(
+    pub(crate) fn build_multibuffer(
         buffer: Entity<Buffer>,
         diff: Entity<buffer_diff::BufferDiff>,
         showing_full_file: bool,
@@ -200,7 +200,7 @@ impl SoloDiffView {
         multibuffer
     }
 
-    fn excerpt_ranges(
+    pub(crate) fn excerpt_ranges(
         buffer: &Entity<Buffer>,
         diff: &Entity<buffer_diff::BufferDiff>,
         showing_full_file: bool,
@@ -233,29 +233,46 @@ impl SoloDiffView {
             .collect()
     }
 
-    fn set_showing_full_file(&mut self, showing_full_file: bool, cx: &mut Context<Self>) {
-        if self.showing_full_file == showing_full_file {
-            return;
-        }
-
+    /// Shows either the whole file or only its changed hunks in `editor`.
+    pub(crate) fn show_excerpts(
+        editor: &Entity<SplittableEditor>,
+        buffer: &Entity<Buffer>,
+        diff: &Entity<buffer_diff::BufferDiff>,
+        showing_full_file: bool,
+        cx: &mut App,
+    ) {
         let (ranges, context_line_count) =
-            Self::excerpt_ranges(&self.buffer, &self.diff, showing_full_file, cx);
+            Self::excerpt_ranges(buffer, diff, showing_full_file, cx);
 
-        self.editor.update(cx, |editor, cx| {
-            let path = PathKey::for_buffer(&self.buffer, cx);
+        editor.update(cx, |editor, cx| {
+            let path = PathKey::for_buffer(buffer, cx);
             editor.remove_excerpts_for_path(path.clone(), cx);
             editor.update_excerpts_for_path(
                 path,
-                self.buffer.clone(),
+                buffer.clone(),
                 ranges,
                 context_line_count,
-                self.diff.clone(),
+                diff.clone(),
                 cx,
             );
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_allow_git_diff_scrollbar_markers(showing_full_file, cx);
             });
         });
+    }
+
+    fn set_showing_full_file(&mut self, showing_full_file: bool, cx: &mut Context<Self>) {
+        if self.showing_full_file == showing_full_file {
+            return;
+        }
+
+        Self::show_excerpts(
+            &self.editor,
+            &self.buffer,
+            &self.diff,
+            showing_full_file,
+            cx,
+        );
 
         self.showing_full_file = showing_full_file;
         cx.notify();

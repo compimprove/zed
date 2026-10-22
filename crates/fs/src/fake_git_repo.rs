@@ -81,10 +81,15 @@ pub struct FakeGitRepositoryState {
     pub refs: HashMap<String, String>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
+    /// Files changed by a commit, by commit SHA: (path, old text, new text).
+    pub commit_diffs: HashMap<String, Vec<(RepoPath, Option<String>, Option<String>)>>,
     pub stash_entries: GitStash,
     pub fetches: Arc<Mutex<Vec<FetchOptions>>>,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
+    /// Arguments of every command passed to `run_git_command`.
+    pub git_commands: Vec<Vec<String>>,
+    pub simulated_git_command_error: Option<String>,
 }
 
 impl FakeGitRepositoryState {
@@ -112,10 +117,13 @@ impl FakeGitRepositoryState {
             remotes: HashMap::default(),
             graph_commits: Vec::new(),
             commit_data: Default::default(),
+            commit_diffs: Default::default(),
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             fetches: Arc::default(),
             commit_template: None,
+            git_commands: Vec::new(),
+            simulated_git_command_error: None,
         }
     }
 }
@@ -291,17 +299,45 @@ impl GitRepository for FakeGitRepository {
 
     fn load_commit(
         &self,
-        _commit: String,
+        commit: String,
         _ignore_shallow_boundary: bool,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
-        async {
+        self.with_state_async(false, move |state| {
+            let files = state
+                .commit_diffs
+                .get(&commit)
+                .into_iter()
+                .flatten()
+                .map(|(path, old_text, new_text)| git::repository::CommitFile {
+                    path: path.clone(),
+                    old_content: old_text.clone().map(String::into_bytes),
+                    new_content: new_text.clone().map(String::into_bytes),
+                    is_binary: false,
+                })
+                .collect();
             Ok(git::repository::CommitDiff {
-                files: Vec::new(),
+                files,
                 is_shallow_boundary: false,
             })
-        }
-        .boxed()
+        })
+    }
+
+    /// Reads the files from `commit_diffs` under `base..target`, or
+    /// `base...target` for a merge base diff.
+    fn load_range_diff(
+        &self,
+        base: String,
+        target: String,
+        merge_base: bool,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
+        let range = if merge_base {
+            format!("{base}...{target}")
+        } else {
+            format!("{base}..{target}")
+        };
+        self.load_commit(range, false, cx)
     }
 
     fn set_index_text(
@@ -1310,6 +1346,22 @@ impl GitRepository for FakeGitRepository {
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
         unimplemented!()
+    }
+
+    fn run_git_command(
+        &self,
+        args: Vec<String>,
+        _askpass: AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
+        self.with_state_async(true, move |state| {
+            state.git_commands.push(args);
+            if let Some(message) = state.simulated_git_command_error.clone() {
+                bail!(message);
+            }
+            Ok(git::repository::RemoteCommandOutput::default())
+        })
     }
 
     fn pull(
