@@ -769,6 +769,27 @@ pub struct SearchCommitArgs {
     pub case_sensitive: bool,
 }
 
+/// Returns the ref name of a `%D` log decoration such as `HEAD -> main`,
+/// `origin/main` or `tag: v1.0`, or `None` for a bare `HEAD`.
+pub fn ref_name_from_decoration(decoration: &str) -> Option<&str> {
+    let name = decoration
+        .strip_prefix("tag: ")
+        .or_else(|| decoration.strip_prefix("HEAD -> "))
+        .unwrap_or(decoration);
+    (!name.is_empty() && name != "HEAD").then_some(name)
+}
+
+pub fn ref_name_matches_search(decoration: &str, query: &str, case_sensitive: bool) -> bool {
+    let Some(name) = ref_name_from_decoration(decoration) else {
+        return false;
+    };
+    if case_sensitive {
+        name.contains(query)
+    } else {
+        name.to_lowercase().contains(&query.to_lowercase())
+    }
+}
+
 pub fn commit_hash_search_query(query: &str) -> Option<&str> {
     let query = query.trim();
     (SHORT_SHA_LENGTH..=SHA256_HEX_LENGTH)
@@ -3513,6 +3534,35 @@ impl GitRepository for RealGitRepository {
             let hash_query = commit_hash_search_query(search_args.query.as_str())
                 .map(|query| query.to_ascii_lowercase());
 
+            // Commits whose branch or tag names match come first, so searching
+            // for a branch jumps to its tip.
+            let mut ref_matches = HashSet::new();
+            if hash_query.is_none() && !matches!(log_source, LogSource::Path(_)) {
+                let mut ref_args = vec!["log", "--simplify-by-decoration", "--format=%H%x00%D"];
+                ref_args.extend(log_source_args.iter().map(|arg| arg.as_ref()));
+                let output = git.build_command(&ref_args).output().await?;
+                if output.status.success() {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        let Some((sha, decorations)) = line.split_once('\0') else {
+                            continue;
+                        };
+                        let is_match = decorations.split(", ").any(|decoration| {
+                            ref_name_matches_search(
+                                decoration,
+                                search_args.query.as_str(),
+                                search_args.case_sensitive,
+                            )
+                        });
+                        if is_match && let Ok(oid) = Oid::from_str(sha) {
+                            if request_tx.send(oid).await.is_err() {
+                                return Ok(());
+                            }
+                            ref_matches.insert(oid);
+                        }
+                    }
+                }
+            }
+
             if hash_query.is_none() {
                 args.push("--fixed-strings");
 
@@ -3551,6 +3601,7 @@ impl GitRepository for RealGitRepository {
                 }
 
                 if let Ok(oid) = Oid::from_str(sha)
+                    && !ref_matches.contains(&oid)
                     && request_tx.send(oid).await.is_err()
                 {
                     break;
@@ -5284,6 +5335,62 @@ mod tests {
         assert_eq!(
             git.run(&["symbolic-ref", "HEAD"]).await.unwrap(),
             "refs/heads/Feature"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_search_commits_matches_branch_names(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        git_init_repo(&repo_dir);
+        fs::write(repo_dir.join("file.txt"), "base").unwrap();
+        git_command(&repo_dir, ["add", "file.txt"]);
+        git_command(&repo_dir, ["commit", "-m", "base"]);
+        git_command(&repo_dir, ["switch", "-c", "Feat/login-page"]);
+        fs::write(repo_dir.join("file.txt"), "feature").unwrap();
+        git_command(&repo_dir, ["commit", "-am", "add login form"]);
+        git_command(&repo_dir, ["commit", "--allow-empty", "-m", "polish login"]);
+        git_command(&repo_dir, ["switch", "main"]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let rev = |name: &str| {
+            Oid::from_str(git_command_output(&repo_dir, ["rev-parse", name]).trim()).unwrap()
+        };
+        let search = async |query: &str, case_sensitive: bool| {
+            let (tx, rx) = async_channel::unbounded();
+            repository
+                .search_commits(
+                    LogSource::All,
+                    SearchCommitArgs {
+                        query: query.to_string().into(),
+                        case_sensitive,
+                    },
+                    tx,
+                )
+                .await
+                .unwrap();
+            let mut oids = Vec::new();
+            while let Ok(oid) = rx.try_recv() {
+                oids.push(oid);
+            }
+            oids
+        };
+
+        let feature_tip = rev("Feat/login-page");
+        assert_eq!(search("feat/login", false).await, vec![feature_tip]);
+        assert_eq!(search("feat/login", true).await, Vec::<Oid>::new());
+        assert_eq!(
+            search("login", false).await,
+            vec![feature_tip, rev("Feat/login-page~1")]
         );
     }
 

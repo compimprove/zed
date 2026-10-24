@@ -16,7 +16,7 @@ use git::{
         CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
         GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
         PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
-        commit_hash_search_query,
+        commit_hash_search_query, ref_name_matches_search,
     },
     stash::GitStash,
     status::{
@@ -1742,9 +1742,25 @@ impl GitRepository for FakeGitRepository {
             };
 
             let matching_shas = self.fs.with_git_state(&self.dot_git_path, false, |state| {
-                state
+                let ref_matches = state
+                    .graph_commits
+                    .iter()
+                    .filter(|commit| {
+                        hash_query.is_none()
+                            && commit.ref_names.iter().any(|decoration| {
+                                ref_name_matches_search(
+                                    decoration,
+                                    search_args.query.as_str(),
+                                    search_args.case_sensitive,
+                                )
+                            })
+                    })
+                    .map(|commit| commit.sha)
+                    .collect::<Vec<_>>();
+                let message_matches = state
                     .commit_data
                     .iter()
+                    .filter(|(sha, _)| !ref_matches.contains(sha))
                     .filter_map(|(sha, entry)| {
                         let FakeCommitDataEntry::Success(commit_data) = entry else {
                             return None;
@@ -1763,7 +1779,8 @@ impl GitRepository for FakeGitRepository {
                         };
                         message.contains(&message_query).then_some(*sha)
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                ref_matches.into_iter().chain(message_matches).collect::<Vec<_>>()
             })?;
 
             for sha in matching_shas {
