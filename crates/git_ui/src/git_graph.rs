@@ -1842,7 +1842,7 @@ impl GitGraph {
 
         let search_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search commits…", window, cx);
+            editor.set_placeholder_text("Search…", window, cx);
             editor
         });
 
@@ -2086,14 +2086,8 @@ impl GitGraph {
     /// Extracts a ref name (branch, remote ref, or tag) from a decoration in
     /// git's `%D` format, returning `None` for a detached `HEAD`.
     fn ref_name_from_decoration(decoration: &str) -> Option<SharedString> {
-        let name = decoration
-            .strip_prefix("tag: ")
-            .or_else(|| decoration.strip_prefix("HEAD -> "))
-            .unwrap_or(decoration);
-        if name.is_empty() || name == "HEAD" {
-            return None;
-        }
-        Some(SharedString::from(name.to_string()))
+        git::repository::ref_name_from_decoration(decoration)
+            .map(|name| SharedString::from(name.to_string()))
     }
 
     /// Groups a commit's `%D` decorations into the chips shown in the
@@ -3651,7 +3645,7 @@ impl GitGraph {
                 let tooltip_action = action.boxed_clone();
                 IconButton::new(id, icon)
                     .size(ButtonSize::Large)
-                    .width(rems_from_px(32.))
+                    .width(rems_from_px(32_f32))
                     .icon_size(IconSize::Medium)
                     .icon_color(color)
                     .tooltip(move |_, cx| {
@@ -7792,6 +7786,15 @@ mod tests {
 
         git_graph.read_with(&*cx, |graph, _| {
             assert_eq!(graph.search_matches_for_test(), vec![third_sha]);
+        });
+
+        git_graph.update(cx, |graph, cx| {
+            graph.search_for_test("MAIN".into(), cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(graph.search_matches_for_test(), vec![first_sha]);
         });
     }
 
