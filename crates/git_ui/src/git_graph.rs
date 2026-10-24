@@ -1819,9 +1819,7 @@ impl GitGraph {
         // Like focusing an editor, focusing the graph makes its repository the
         // active one, so git actions such as fetch and push apply to it.
         cx.on_focus_in(&focus_handle, window, |this: &mut Self, _, cx| {
-            if let Some(repository) = this.get_repository(cx) {
-                repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
-            }
+            this.activate_repository(cx);
         })
         .detach();
 
@@ -3599,6 +3597,73 @@ impl GitGraph {
         self.set_context_menu(context_menu, position, None, window, cx);
     }
 
+    /// Makes the graph's repository the active one, which git actions such as
+    /// fetch and push apply to.
+    fn activate_repository(&self, cx: &mut App) {
+        if let Some(repository) = self.get_repository(cx) {
+            repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        }
+    }
+
+    /// Fetch, pull and push buttons for the graph's repository.
+    fn render_remote_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let buttons: [(&'static str, IconName, Color, &'static str, Box<dyn Action>); 5] = [
+            (
+                "git-graph-fetch",
+                IconName::ArrowCircle,
+                Color::Default,
+                "Fetch",
+                Box::new(git::Fetch),
+            ),
+            (
+                "git-graph-pull",
+                IconName::ArrowDown,
+                Color::Default,
+                "Pull",
+                Box::new(git::Pull),
+            ),
+            (
+                "git-graph-pull-rebase",
+                IconName::ArrowDownRight,
+                Color::Default,
+                "Pull (Rebase)",
+                Box::new(git::PullRebase),
+            ),
+            (
+                "git-graph-push",
+                IconName::ArrowUp,
+                Color::Default,
+                "Push",
+                Box::new(git::Push),
+            ),
+            (
+                "git-graph-force-push",
+                IconName::ArrowUp,
+                Color::Warning,
+                "Force Push",
+                Box::new(git::ForcePush),
+            ),
+        ];
+        h_flex()
+            .gap_1()
+            .children(buttons.into_iter().map(|(id, icon, color, label, action)| {
+                let focus_handle = self.focus_handle.clone();
+                let tooltip_action = action.boxed_clone();
+                IconButton::new(id, icon)
+                    .size(ButtonSize::Large)
+                    .width(rems_from_px(32.))
+                    .icon_size(IconSize::Medium)
+                    .icon_color(color)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action_in(label, &*tooltip_action, &focus_handle, cx)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_repository(cx);
+                        window.dispatch_action(action.boxed_clone(), cx);
+                    }))
+            }))
+    }
+
     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let color = cx.theme().colors();
         let query_focus_handle = self
@@ -3623,6 +3688,7 @@ impl GitGraph {
                     .h_8()
                     .flex_1()
                     .min_w_0()
+                    .max_w(px(420.))
                     .px_1p5()
                     .gap_1()
                     .track_focus(&query_focus_handle)
@@ -3740,6 +3806,8 @@ impl GitGraph {
                             ),
                     ),
             )
+            .child(div().flex_1())
+            .child(self.render_remote_buttons(cx))
     }
 
     fn render_loading_spinner(&self, cx: &App) -> AnyElement {
@@ -6863,6 +6931,78 @@ mod tests {
             error_message.contains("bad default revision"),
             "error should contain the git error message, got: {}",
             error_message
+        );
+    }
+
+    #[gpui::test]
+    async fn test_focusing_graph_activates_its_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project_a"), json!({ ".git": {}, "a.txt": "a" }))
+            .await;
+        fs.insert_tree(Path::new("/project_b"), json!({ ".git": {}, "b.txt": "b" }))
+            .await;
+        let project = Project::test(
+            fs.clone(),
+            [Path::new("/project_a"), Path::new("/project_b")],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+
+        let repository_at = |path: &str, cx: &mut TestAppContext| {
+            project.read_with(cx, |project, cx| {
+                project
+                    .repositories(cx)
+                    .values()
+                    .find(|repository| {
+                        repository.read(cx).work_directory_abs_path.as_ref() == Path::new(path)
+                    })
+                    .cloned()
+                    .expect("repository should exist")
+            })
+        };
+        let repository_a = repository_at("/project_a", cx);
+        let repository_b = repository_at("/project_b", cx);
+        repository_b.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        cx.run_until_parked();
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let workspace_weak = workspace.downgrade();
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository_a.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |git_graph, window, cx| {
+            window.focus(&git_graph.focus_handle, cx);
+        });
+        cx.run_until_parked();
+
+        let active_repository = project.read_with(&*cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .map(|repository| repository.read(cx).id)
+        });
+        assert_eq!(
+            active_repository,
+            Some(repository_a.read_with(&*cx, |repository, _| repository.id))
         );
     }
 
