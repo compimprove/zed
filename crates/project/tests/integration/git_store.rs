@@ -2538,6 +2538,44 @@ mod repository_activation_tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_linked_worktree_of_active_repository_is_not_parked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (fs, project) = build_project(
+            cx,
+            json!({
+                "repo": {
+                    ".git": {},
+                    "a.txt": ""
+                }
+            }),
+        )
+        .await;
+
+        assert_repositories(&project, cx, &[path!("/root/repo")], &[]);
+
+        fs.add_linked_worktree_for_repo(
+            Path::new(path!("/root/repo/.git")),
+            true,
+            git::repository::Worktree {
+                path: PathBuf::from(path!("/root/.worktrees/TICKET-1/repo")),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+        cx.executor().run_until_parked();
+
+        assert_repositories(
+            &project,
+            cx,
+            &[path!("/root/.worktrees/TICKET-1/repo"), path!("/root/repo")],
+            &[],
+        );
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         zlog::init_test();
 

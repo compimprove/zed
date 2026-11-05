@@ -1346,7 +1346,7 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        async { Ok(git::repository::RemoteCommandOutput::default()) }.boxed()
     }
 
     fn run_git_command(
@@ -1374,7 +1374,7 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        async { Ok(git::repository::RemoteCommandOutput::default()) }.boxed()
     }
 
     fn fetch(
@@ -1708,7 +1708,10 @@ impl GitRepository for FakeGitRepository {
                         message.contains(&message_query).then_some(*sha)
                     })
                     .collect::<Vec<_>>();
-                ref_matches.into_iter().chain(message_matches).collect::<Vec<_>>()
+                ref_matches
+                    .into_iter()
+                    .chain(message_matches)
+                    .collect::<Vec<_>>()
             })?;
 
             for sha in matching_shas {

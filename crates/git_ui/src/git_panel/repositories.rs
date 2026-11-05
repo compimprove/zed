@@ -5,9 +5,11 @@
 
 use std::{path::Path, sync::Arc};
 
-use gpui::{Action as _, Anchor, AnyElement, Entity, SharedString, Window};
+use git_ui_core::worktree_picker::force_delete_prompt_for_worktree_remove_error;
+use gpui::{Action as _, Anchor, AnyElement, Entity, PromptLevel, SharedString, Window};
 use project::git_store::Repository;
 use ui::{Disclosure, ListItem, ListItemSpacing, PopoverMenu, Tooltip, prelude::*};
+use workspace::notifications::DetachAndPromptErr as _;
 
 use super::{GitPanel, section_resize};
 use crate::{git_graph::open_or_reuse_graph, repository_selector::RepositorySelector};
@@ -227,6 +229,19 @@ impl GitPanel {
         let name = SharedString::from(file_name(&path.work_directory));
         let tooltip_path = SharedString::from(path.work_directory.display().to_string());
         let repository = repository.clone();
+        let remove_button = path.is_worktree.then(|| {
+            let repository = repository.clone();
+            IconButton::new(
+                SharedString::from(format!("remove-worktree-{}", path.work_directory.display())),
+                IconName::Trash,
+            )
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text("Remove Worktree"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.remove_linked_worktree(repository.clone(), window, cx);
+            }))
+        });
 
         ListItem::new(SharedString::from(format!(
             "repository-{}",
@@ -252,6 +267,9 @@ impl GitPanel {
                     .size(IconSize::Small)
                     .color(Color::Accent),
             )
+        })
+        .when_some(remove_button, |this, remove_button| {
+            this.end_slot_on_hover(remove_button)
         })
         .tooltip(Tooltip::text(tooltip_path))
         .on_click(cx.listener(move |this, _, window, cx| {
@@ -279,6 +297,88 @@ impl GitPanel {
                 .ok();
         }))
         .into_any_element()
+    }
+
+    fn remove_linked_worktree(
+        &mut self,
+        worktree_repository: Entity<Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (worktree_path, common_dir_abs_path) = {
+            let worktree_repository = worktree_repository.read(cx);
+            (
+                worktree_repository.work_directory_abs_path.to_path_buf(),
+                worktree_repository.common_dir_abs_path.clone(),
+            )
+        };
+        // Run git from the main checkout when it's in the project, since removing the
+        // worktree deletes the directory the linked worktree's repository runs git in.
+        let repository = self
+            .project
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repositories()
+            .values()
+            .find(|repository| {
+                let repository = repository.read(cx);
+                !repository.is_linked_worktree()
+                    && repository.common_dir_abs_path == common_dir_abs_path
+            })
+            .cloned()
+            .unwrap_or(worktree_repository);
+        let display_name = file_name(&worktree_path);
+
+        cx.spawn_in(window, async move |_, cx| {
+            let answer = cx.update(|window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    &format!("Remove worktree \"{display_name}\"?"),
+                    Some(&worktree_path.display().to_string()),
+                    &["Remove", "Cancel"],
+                    cx,
+                )
+            })?;
+            if answer.await != Ok(0) {
+                return Ok(());
+            }
+
+            let result = repository
+                .update(cx, |repository, _| {
+                    repository.remove_worktree(worktree_path.clone(), false)
+                })
+                .await?;
+            let Err(error) = result else {
+                return Ok(());
+            };
+            let Some(force_delete_message) =
+                force_delete_prompt_for_worktree_remove_error(&error, &display_name)
+            else {
+                return Err(error);
+            };
+
+            let answer = cx.update(|window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    &force_delete_message,
+                    None,
+                    &["Force Delete", "Cancel"],
+                    cx,
+                )
+            })?;
+            if answer.await != Ok(0) {
+                return Ok(());
+            }
+            repository
+                .update(cx, |repository, _| {
+                    repository.remove_worktree(worktree_path, true)
+                })
+                .await?
+        })
+        .detach_and_prompt_err("Failed to remove worktree", window, cx, |error, _, _| {
+            Some(format!("{error:#}"))
+        });
     }
 
     /// Reuses the repository picker to search repositories by name.

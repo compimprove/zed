@@ -1218,7 +1218,6 @@ mod remote_button {
                         })
                         .action("Fetch", git::Fetch.boxed_clone())
                         .action("Fetch From", git::FetchFrom.boxed_clone())
-                        .action("Prune origin", git::PruneOrigin.boxed_clone())
                         .action("Pull", git::Pull.boxed_clone())
                         .action("Pull (Rebase)", git::PullRebase.boxed_clone())
                         .separator()

@@ -6554,7 +6554,7 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn git_panel_section() -> [SettingsPageItem; 19] {
+    fn git_panel_section() -> [SettingsPageItem; 20] {
         [
             SettingsPageItem::SectionHeader("Git Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -6876,6 +6876,29 @@ fn panels_page() -> SettingsPage {
                             .git_panel
                             .get_or_insert_default()
                             .commit_title_max_length = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Graph Ref Label Max Length",
+                description: "Maximum number of characters shown in a branch or tag label in the Git graph before it is cut off with an ellipsis.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.graph_ref_label_max_length"),
+                    pick: |settings_content| {
+                        settings_content
+                            .git_panel
+                            .as_ref()?
+                            .graph_ref_label_max_length
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .graph_ref_label_max_length = value;
                     },
                 }),
                 metadata: None,

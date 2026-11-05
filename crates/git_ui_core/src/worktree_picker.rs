@@ -361,7 +361,7 @@ fn dirty_worktree_force_delete_prompt(display_name: &str) -> String {
     format!("Worktree \"{display_name}\" contains modified or untracked files. Force delete it?")
 }
 
-fn force_delete_prompt_for_worktree_remove_error(
+pub fn force_delete_prompt_for_worktree_remove_error(
     error: &anyhow::Error,
     display_name: &str,
 ) -> Option<String> {

@@ -1,5 +1,5 @@
 use editor::{EditorSettings, ui_scrollbar_settings_from_raw};
-use gpui::Pixels;
+use gpui::{Hsla, Pixels};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
@@ -7,6 +7,7 @@ use settings::{
     IntoGpui, RegisterSetting, Settings, StatusStyle,
 };
 use ui::scrollbars::{ScrollbarVisibility, ShowScrollbar};
+use util::ResultExt as _;
 use workspace::dock::DockPosition;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -32,6 +33,8 @@ pub struct GitPanelSettings {
     pub show_count_badge: bool,
     pub starts_open: bool,
     pub commit_title_max_length: usize,
+    pub graph_ref_label_max_length: usize,
+    pub graph_colors: Vec<Hsla>,
     pub entry_primary_click_action: GitPanelClickBehavior,
     pub commit_editor: GitPanelCommitEditor,
 }
@@ -82,6 +85,13 @@ impl Settings for GitPanelSettings {
             show_count_badge: git_panel.show_count_badge.unwrap(),
             starts_open: git_panel.starts_open.unwrap(),
             commit_title_max_length: git_panel.commit_title_max_length.unwrap(),
+            graph_ref_label_max_length: git_panel.graph_ref_label_max_length.unwrap(),
+            graph_colors: git_panel
+                .graph_colors
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|color| theme::try_parse_color(color).log_err())
+                .collect(),
             entry_primary_click_action: git_panel.entry_primary_click_action.unwrap(),
             commit_editor: git_panel.commit_editor.unwrap(),
         }

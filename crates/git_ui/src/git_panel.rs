@@ -7394,16 +7394,12 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let active_repository = self.active_repository.clone()?;
+        self.active_repository.as_ref()?;
         let settings = ThemeSettings::get_global(cx);
         let panel_editor_style =
             git_commit_editor_style(settings.git_commit_buffer_font_size(cx), cx);
         let enable_coauthors = self.render_co_authors(cx);
         let editor_focus_handle = self.commit_editor.focus_handle(cx);
-        let branch = active_repository.read(cx).branch.clone();
-        let head_commit = active_repository.read(cx).head_commit.clone();
-
-        let git_panel = cx.entity();
         let editor_is_long = self.commit_editor.update(cx, |editor, cx| {
             editor.max_point(cx).row().0 >= MAX_PANEL_EDITOR_LINES as u32
         });
@@ -7596,8 +7592,7 @@ impl GitPanel {
                                     .child(self.render_commit_button(cx)),
                             ),
                     ),
-            )
-            .child(PanelRepoFooter::new(branch, head_commit, Some(git_panel)));
+            );
 
         Some(footer)
     }
@@ -8002,7 +7997,7 @@ impl GitPanel {
                 |this, _repo, event, cx| {
                     if matches!(
                         event,
-                        RepositoryEvent::GraphEvent(_, _) | RepositoryEvent::TagsChanged
+                        RepositoryEvent::GraphEvent(_, _) | RepositoryEvent::RefsChanged
                     ) {
                         if this.active_tab == GitPanelTab::History {
                             this.fetch_commit_history_entries(cx);

@@ -7258,6 +7258,8 @@ See the [debugger page](../debugger.md) for more information about debugging sup
     "show_count_badge": false,
     "diff_stats": true,
     "commit_title_max_length": 0,
+    "graph_ref_label_max_length": 45,
+    "graph_colors": [],
     "entry_primary_click_action": "project_diff",
     "commit_editor": "expanded"
   }
@@ -7283,6 +7285,8 @@ See the [debugger page](../debugger.md) for more information about debugging sup
 - `show_count_badge`: Whether to show a badge on the git panel icon with the count of uncommitted changes
 - `diff_stats`: Whether to show the addition/deletion change count next to each file in the git panel
 - `commit_title_max_length`: Maximum length of the commit message title before a warning is shown. Set to `0` to disable
+- `graph_ref_label_max_length`: Maximum number of characters shown in a branch or tag label in the Git graph before it is cut off with an ellipsis
+- `graph_colors`: Colors for the branches in the Git graph, as hex strings such as `"#0085d9"`. When empty, the theme's accent colors are used
 - `entry_primary_click_action`: Default action when clicking a changed file in the git panel. Can be `project_diff`, `file_diff`, or `view_file`
 
 ## Git Worktree Directory

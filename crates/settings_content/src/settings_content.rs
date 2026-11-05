@@ -818,6 +818,18 @@ pub struct GitPanelSettingsContent {
     /// Default: 0
     pub commit_title_max_length: Option<usize>,
 
+    /// Maximum number of characters shown in a branch or tag label in the
+    /// Git graph before it is cut off with an ellipsis.
+    ///
+    /// Default: 45
+    pub graph_ref_label_max_length: Option<usize>,
+
+    /// Colors for the branches in the Git graph, as hex strings such as
+    /// `"#0085d9"`. When empty, the theme's accent colors are used.
+    ///
+    /// Default: []
+    pub graph_colors: Option<Vec<String>>,
+
     /// Default action when clicking a changed file in the Git panel.
     ///
     /// Default: project_diff

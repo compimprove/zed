@@ -891,10 +891,13 @@ pub enum RepositoryEvent {
     StatusesChanged,
     HeadChanged,
     BranchListChanged,
-    TagsChanged,
+    /// Branches, remote-tracking refs, or tags may have moved.
+    RefsChanged,
     StashEntriesChanged,
     GitWorktreeListChanged,
-    PendingOpsChanged { pending_ops: SumTree<PendingOps> },
+    PendingOpsChanged {
+        pending_ops: SumTree<PendingOps>,
+    },
     GraphEvent((LogSource, LogOrder), GitGraphEvent),
 }
 
@@ -2775,11 +2778,16 @@ impl GitStore {
             Ok(relative_path) => relative_path.components().count() >= MIN_PARKED_REPOSITORY_DEPTH,
             Err(_) => false,
         };
+        // A linked worktree of an active repository is part of work the user is already
+        // doing (e.g. created with `git worktree add`), so it shouldn't wait for a buffer
+        // to be opened inside it before showing up.
         deep_enough
             && !self.repositories.values().any(|active_repository| {
+                let active_repository = active_repository.read(cx);
                 repository
                     .work_directory_abs_path
-                    .starts_with(&active_repository.read(cx).work_directory_abs_path)
+                    .starts_with(&active_repository.work_directory_abs_path)
+                    || active_repository.common_dir_abs_path == repository.common_dir_abs_path
             })
             && !self.buffer_store.read(cx).buffers().any(|buffer| {
                 buffer
@@ -2927,7 +2935,15 @@ impl GitStore {
             cx.emit(GitStoreEvent::ActiveRepositoryChanged(Some(id)));
             id
         });
-        self.activate_parked_repositories_under(&repository.work_directory_abs_path, cx);
+        self.activate_parked_repositories(
+            |parked| {
+                parked
+                    .work_directory_abs_path
+                    .starts_with(&repository.work_directory_abs_path)
+                    || parked.common_dir_abs_path == repository.common_dir_abs_path
+            },
+            cx,
+        );
     }
 
     fn activate_parked_repositories_under(
@@ -6641,8 +6657,8 @@ impl Repository {
                     self.initial_graph_data.clear();
                 }
             }
-            // Tags are only changed by explicit user actions, never during the initial scan.
-            RepositoryEvent::TagsChanged => {
+            // Refs are only reported as changed after explicit user actions, never during the initial scan.
+            RepositoryEvent::RefsChanged => {
                 self.initial_graph_data.clear();
             }
             RepositoryEvent::StashEntriesChanged => {
@@ -6860,6 +6876,33 @@ impl Repository {
         R: Send + 'static,
     {
         self.send_keyed_job(description, None, status, job)
+    }
+
+    /// Runs a job whose git command may move refs. Listeners are told once it
+    /// finishes, because a rescan only reports ref moves that change the
+    /// branch list, and it may have already observed them before this point.
+    fn send_ref_changing_job<F, Fut, R>(
+        &mut self,
+        description: &'static str,
+        status: Option<SharedString>,
+        job: F,
+    ) -> oneshot::Receiver<R>
+    where
+        F: FnOnce(RepositoryState, AsyncApp) -> Fut + 'static,
+        Fut: Future<Output = R> + 'static,
+        R: Send + 'static,
+    {
+        let this = self.this.clone();
+        self.send_job(description, status, move |state, cx| {
+            let mut event_cx = cx.clone();
+            let job = job(state, cx);
+            async move {
+                let result = job.await;
+                this.update(&mut event_cx, |_, cx| cx.emit(RepositoryEvent::RefsChanged))
+                    .ok();
+                result
+            }
+        })
     }
 
     fn send_keyed_job<F, Fut, R>(
@@ -8854,9 +8897,10 @@ impl Repository {
             });
 
         let this = cx.weak_entity();
-        let status = askpass.is_some().then(|| "git fetch".into());
+        let user_initiated = askpass.is_some();
+        let status = user_initiated.then(|| "git fetch".into());
         self.send_job("fetch", status, move |git_repo, mut cx| async move {
-            match git_repo {
+            let result = match git_repo {
                 RepositoryState::Local(LocalRepositoryState {
                     backend,
                     environment,
@@ -8895,7 +8939,17 @@ impl Repository {
                         stderr: response.stderr,
                     })
                 }
+            };
+            // `git fetch` prints nothing when no ref moved, so a quiet
+            // background fetch doesn't make listeners reload.
+            if result
+                .as_ref()
+                .is_ok_and(|output| user_initiated || !output.is_empty())
+            {
+                this.update(&mut cx, |_, cx| cx.emit(RepositoryEvent::RefsChanged))
+                    .ok();
             }
+            result
         })
     }
 
@@ -8929,7 +8983,7 @@ impl Repository {
             });
 
         let this = cx.weak_entity();
-        self.send_job(
+        self.send_ref_changing_job(
             "push",
             Some(format!("git push {} {} {}:{}", args, remote, branch, remote_branch).into()),
             move |git_repo, mut cx| async move {
@@ -8998,13 +9052,12 @@ impl Repository {
         let askpass_delegates = self.askpass_delegates.clone();
         let askpass_id = util::post_inc(&mut self.latest_askpass_id);
         let id = self.id;
-        let this = cx.weak_entity();
 
-        let receiver = self.send_job(
+        let receiver = self.send_ref_changing_job(
             "git",
             Some(format!("git {}", args.join(" ")).into()),
-            move |git_repo, mut cx| async move {
-                let result = match git_repo {
+            move |git_repo, cx| async move {
+                match git_repo {
                     RepositoryState::Local(LocalRepositoryState {
                         backend,
                         environment,
@@ -9030,11 +9083,7 @@ impl Repository {
                                 stderr: response.stderr,
                             })
                     }
-                };
-                // Any command may have moved tags, which a rescan doesn't report.
-                this.update(&mut cx, |_, cx| cx.emit(RepositoryEvent::TagsChanged))
-                    .ok();
-                result
+                }
             },
         );
 
@@ -9076,7 +9125,7 @@ impl Repository {
             status.push_str(&format!(" {}", b));
         }
 
-        self.send_job(
+        self.send_ref_changing_job(
             "pull",
             Some(status.into()),
             move |git_repo, cx| async move {
@@ -9570,7 +9619,7 @@ impl Repository {
                 }
 
                 this.update(&mut cx, |_, cx| {
-                    cx.emit(RepositoryEvent::TagsChanged);
+                    cx.emit(RepositoryEvent::RefsChanged);
                 })?;
                 Ok(())
             },
