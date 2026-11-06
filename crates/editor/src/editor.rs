@@ -13509,3 +13509,9 @@ pub fn multibuffer_context_lines(cx: &App) -> u32 {
         .unwrap_or(2)
         .min(32)
 }
+
+/// Context lines around search results and reference locations, which need
+/// more of the surrounding code than other multibuffers to be read on their own.
+pub fn search_results_context_lines(cx: &App) -> u32 {
+    multibuffer_context_lines(cx).max(5)
+}

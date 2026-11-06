@@ -3368,7 +3368,12 @@ mod tests {
                 EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
             let source = cx.editor.clone();
             let (buffer, selections) = cx.update_editor(|editor, window, cx| {
-                editor.set_text("origin\n\nfirst\n\n\n\n\n\nsecond\n", window, cx);
+                // Far enough apart that the matches don't share an excerpt.
+                editor.set_text(
+                    format!("origin\n\nfirst\n{}second\n", "\n".repeat(12)),
+                    window,
+                    cx,
+                );
                 (
                     editor.buffer.read(cx).as_singleton().expect("buffer"),
                     editor.selections.disjoint_anchors_arc(),
@@ -3376,7 +3381,7 @@ mod tests {
             });
             cx.run_until_parked();
             cx.update_editor(|editor, window, cx| {
-                let links = [(2, 5), (8, 6)].map(|(row, end)| {
+                let links = [(2, 5), (15, 6)].map(|(row, end)| {
                     HoverLink::Text(LocationLink {
                         origin: None,
                         target: Location {
@@ -3426,7 +3431,7 @@ mod tests {
                         .excerpts()
                         .map(|excerpt| excerpt.primary.to_offset(buffer.read(cx)))
                         .collect::<Vec<_>>(),
-                    [8..13, 19..25],
+                    [8..13, 26..32],
                 );
             });
             cx.update(|window, _| window.remove_window());

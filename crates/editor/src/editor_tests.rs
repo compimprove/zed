@@ -34916,7 +34916,9 @@ async fn test_goto_definition_with_find_all_references_fallback(cx: &mut TestApp
             .read(test_editor_cx)
             .text(test_editor_cx);
         assert_eq!(
-            references_fallback_text, "fn one() {\n    let mut a = two();\n}",
+            // References get at least five lines of context, which covers this whole file.
+            references_fallback_text,
+            "fn one() {\n    let mut a = two();\n}\n\nfn two() {}",
             "Should use the range from the references response and not the GoToDefinition one"
         );
     });

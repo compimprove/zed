@@ -2227,7 +2227,7 @@ impl Editor {
                     PathKey::for_buffer(&buffer, cx),
                     buffer.clone(),
                     ranges_for_buffer.clone(),
-                    multibuffer_context_lines(cx),
+                    search_results_context_lines(cx),
                     cx,
                 );
                 let snapshot = multibuffer.snapshot(cx);

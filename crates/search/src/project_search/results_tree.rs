@@ -209,12 +209,12 @@ pub(super) fn line_preview(line: &str, highlight: Range<usize>) -> (SharedString
     (preview.into(), highlight)
 }
 
-/// Lays the files out as tree rows. Directories are expanded unless
-/// collapsed, and files are collapsed unless expanded.
+/// Lays the files out as tree rows. Directories and files are expanded
+/// unless collapsed.
 pub(super) fn tree_rows(
     files: &[ResultFile],
     collapsed_directories: &HashSet<SharedString>,
-    expanded_files: &HashSet<SharedString>,
+    collapsed_files: &HashSet<SharedString>,
 ) -> Vec<ResultsTreeRow> {
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by(|a, b| files[*a].components.cmp(&files[*b].components));
@@ -250,7 +250,7 @@ pub(super) fn tree_rows(
                 item: file_ix,
                 depth,
             } => {
-                let expanded = expanded_files.contains(&files[file_ix].path);
+                let expanded = !collapsed_files.contains(&files[file_ix].path);
                 rows.push(ResultsTreeRow::File {
                     file_ix,
                     depth,
@@ -309,7 +309,7 @@ pub(super) struct ResultsTree {
     /// The search id and match count the files were collected for.
     files_key: Option<(usize, usize)>,
     collapsed_directories: HashSet<SharedString>,
-    expanded_files: HashSet<SharedString>,
+    collapsed_files: HashSet<SharedString>,
     scroll_handle: UniformListScrollHandle,
     /// Set when the active match changes, to scroll its row into view.
     scroll_to_active: bool,
@@ -334,7 +334,7 @@ impl ResultsTree {
             rows: Vec::new(),
             files_key: None,
             collapsed_directories: HashSet::default(),
-            expanded_files: HashSet::default(),
+            collapsed_files: HashSet::default(),
             scroll_handle: UniformListScrollHandle::new(),
             scroll_to_active: false,
             file_results: None,
@@ -364,7 +364,7 @@ impl ResultsTree {
         self.rows = tree_rows(
             &self.files,
             &self.collapsed_directories,
-            &self.expanded_files,
+            &self.collapsed_files,
         );
     }
 }
@@ -421,8 +421,8 @@ impl ProjectSearchView {
 
     pub(super) fn toggle_results_tree_file(&mut self, path: SharedString, cx: &mut Context<Self>) {
         let tree = &mut self.results_tree;
-        if !tree.expanded_files.remove(&path) {
-            tree.expanded_files.insert(path);
+        if !tree.collapsed_files.remove(&path) {
+            tree.collapsed_files.insert(path);
         }
         tree.update_rows();
         cx.notify();
@@ -953,8 +953,11 @@ mod tests {
             file("src/a.rs", 2..3),
             file("README.md", 3..4),
         ];
-        let expanded = HashSet::from_iter([SharedString::from("src/b.rs")]);
-        let rows = tree_rows(&files, &HashSet::default(), &expanded);
+        let collapsed_files = HashSet::from_iter([
+            SharedString::from("src/a.rs"),
+            SharedString::from("README.md"),
+        ]);
+        let rows = tree_rows(&files, &HashSet::default(), &collapsed_files);
         assert_eq!(
             rows,
             [
@@ -999,7 +1002,7 @@ mod tests {
         assert_eq!(row_for_match(&rows, &files, 9), None);
 
         let collapsed = HashSet::from_iter([SharedString::from("src")]);
-        let rows = tree_rows(&files, &collapsed, &expanded);
+        let rows = tree_rows(&files, &collapsed, &collapsed_files);
         assert_eq!(rows.len(), 2);
         assert_eq!(row_for_match(&rows, &files, 0), None);
     }

@@ -17,8 +17,8 @@ use editor::{
     SearchResultsStatus, SelectionEffects,
     actions::{Backtab, FoldAll, SelectAll, Tab, UnfoldAll},
     items::active_match_index,
-    multibuffer_context_lines,
     scroll::Autoscroll,
+    search_results_context_lines,
 };
 use fs::Fs;
 use futures::{StreamExt, stream::FuturesOrdered};
@@ -740,7 +740,7 @@ async fn consume_search_stream(
                                     PathKey::for_buffer(&buffer, cx),
                                     buffer.clone(),
                                     ranges,
-                                    multibuffer_context_lines(cx),
+                                    search_results_context_lines(cx),
                                     cx,
                                 );
                                 async move { (buffer, new_ranges.await) }
@@ -903,7 +903,7 @@ async fn apply_reused_chunk(
     let (context_line_count, chunk) = project_search
         .read_with(cx, |_, cx| {
             (
-                multibuffer_context_lines(cx),
+                search_results_context_lines(cx),
                 buffers_with_ranges
                     .into_iter()
                     .map(|(buffer, ranges)| {
@@ -7080,7 +7080,7 @@ pub mod tests {
                     .unwrap();
                 assert_eq!(one_rs.matches[1].row, 1);
 
-                // Directories come first and files start collapsed.
+                // Directories come first and files start expanded.
                 let names = search_view
                     .results_tree
                     .rows()
@@ -7097,8 +7097,12 @@ pub mod tests {
                         "src/",
                         "nested/",
                         "src/nested/two.rs",
+                        "match",
                         "src/one.rs",
-                        "README.md"
+                        "match",
+                        "match",
+                        "README.md",
+                        "match"
                     ]
                 );
                 one_rs.matches[1].index
@@ -7196,7 +7200,7 @@ pub mod tests {
             .unwrap();
         draw(cx);
 
-        // Expanding the file shows its matches.
+        // Collapsing the file hides its matches.
         search_view
             .update(cx, |search_view, _, cx| {
                 search_view.toggle_results_tree_file("src/one.rs".into(), cx);
