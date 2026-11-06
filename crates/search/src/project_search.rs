@@ -83,6 +83,7 @@ actions!(
     ]
 );
 
+mod references;
 mod results_tree;
 use results_tree::ResultsTree;
 
@@ -119,6 +120,7 @@ impl Global for ActiveSettings {}
 
 pub fn init(cx: &mut App) {
     cx.set_global(ActiveSettings::default());
+    references::init(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         register_workspace_action(workspace, move |search_bar, _: &Deploy, window, cx| {
             search_bar.focus_search(window, cx);
@@ -280,6 +282,9 @@ pub struct ProjectSearch {
     search_included_history_cursor: SearchHistoryCursor,
     search_excluded_history_cursor: SearchHistoryCursor,
     pub project_search_turning_into_text_finder: Arc<AtomicBool>,
+    /// Whether the results are references to a symbol rather than text
+    /// matches, which can't be searched again.
+    references: bool,
     _excerpts_subscription: Subscription,
     _workspace_subscription: Option<Subscription>,
 }
@@ -435,6 +440,7 @@ impl ProjectSearch {
             search_included_history_cursor: Default::default(),
             search_excluded_history_cursor: Default::default(),
             project_search_turning_into_text_finder: Arc::new(AtomicBool::new(false)),
+            references: false,
             _excerpts_subscription: excerpts_subscription,
             _workspace_subscription: workspace_subscription,
         }
@@ -473,6 +479,7 @@ impl ProjectSearch {
                 search_included_history_cursor: self.search_included_history_cursor.clone(),
                 search_excluded_history_cursor: self.search_excluded_history_cursor.clone(),
                 project_search_turning_into_text_finder: Arc::new(AtomicBool::new(false)),
+                references: self.references,
                 _excerpts_subscription: excerpts_subscription,
                 _workspace_subscription: workspace_subscription,
             }
@@ -1153,6 +1160,10 @@ impl Focusable for ProjectSearchView {
 impl Item for ProjectSearchView {
     type Event = ViewEvent;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        let search = self.entity.read(cx);
+        if search.references {
+            return search.last_search_query_text.clone().map(Into::into);
+        }
         let query_text = self.query_editor.read(cx).text(cx);
 
         query_text
@@ -1784,11 +1795,13 @@ impl ProjectSearchView {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        // A references view can't be searched, so a text search gets its own.
         let existing = workspace
             .active_pane()
             .read(cx)
             .items()
-            .find_map(|item| item.downcast::<ProjectSearchView>());
+            .filter_map(|item| item.downcast::<ProjectSearchView>())
+            .find(|search_view| !search_view.read(cx).entity.read(cx).references);
 
         Self::existing_or_new_search(workspace, existing, action, window, cx);
     }
@@ -2024,6 +2037,9 @@ impl ProjectSearchView {
         open_buffers: Option<Vec<Entity<Buffer>>>,
         cx: &mut Context<Self>,
     ) {
+        if self.entity.read(cx).references {
+            return;
+        }
         if let Some(query) = self.build_search_query(cx, open_buffers) {
             self.debounced_search = None;
             let same_inputs = self.last_search_signature.as_ref() == Some(&signature);
@@ -3158,6 +3174,12 @@ impl Render for ProjectSearchBar {
             .unwrap_or_else(|| "0/0".to_string());
 
         let query_focus = search.query_editor.focus_handle(cx);
+        // A references view has no query to edit, so it shows its title instead.
+        let references_title = project_search
+            .references
+            .then(|| project_search.last_search_query_text.clone())
+            .flatten();
+        let references = references_title.is_some();
 
         let query_column = input_base_styles(InputPanel::Query)
             .on_action(cx.listener(|this, action, window, cx| this.confirm(action, window, cx)))
@@ -3258,33 +3280,35 @@ impl Render for ProjectSearchBar {
         let mode_column = h_flex()
             .gap_1()
             .min_w_64()
-            .child(
-                IconButton::new("project-search-filter-button", IconName::Filter)
-                    .shape(IconButtonShape::Square)
-                    .tooltip(|_window, cx| {
-                        Tooltip::for_action("Toggle Filters", &ToggleFilters, cx)
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_filters(window, cx);
-                    }))
-                    .toggle_state(
-                        self.active_project_search
-                            .as_ref()
-                            .map(|search| search.read(cx).filters_enabled)
-                            .unwrap_or_default(),
-                    )
-                    .tooltip({
-                        let focus_handle = focus_handle.clone();
-                        move |_window, cx| {
-                            Tooltip::for_action_in(
-                                "Toggle Filters",
-                                &ToggleFilters,
-                                &focus_handle,
-                                cx,
-                            )
-                        }
-                    }),
-            )
+            .when(!references, |this| {
+                this.child(
+                    IconButton::new("project-search-filter-button", IconName::Filter)
+                        .shape(IconButtonShape::Square)
+                        .tooltip(|_window, cx| {
+                            Tooltip::for_action("Toggle Filters", &ToggleFilters, cx)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_filters(window, cx);
+                        }))
+                        .toggle_state(
+                            self.active_project_search
+                                .as_ref()
+                                .map(|search| search.read(cx).filters_enabled)
+                                .unwrap_or_default(),
+                        )
+                        .tooltip({
+                            let focus_handle = focus_handle.clone();
+                            move |_window, cx| {
+                                Tooltip::for_action_in(
+                                    "Toggle Filters",
+                                    &ToggleFilters,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            }
+                        }),
+                )
+            })
             .child(
                 IconButton::new("project-search-results-tree-button", IconName::ListTree)
                     .shape(IconButtonShape::Square)
@@ -3329,19 +3353,21 @@ impl Render for ProjectSearchBar {
                     )
                 },
             )
-            .child(render_local_action_button(
-                "project-search",
-                IconName::Replace,
-                self.active_project_search
-                    .as_ref()
-                    .map(|search| search.read(cx).replace_enabled)
-                    .and_then(|enabled| enabled.then_some(ActionButtonState::Toggled)),
-                "Toggle Replace",
-                &ToggleReplace,
-                focus_handle.clone(),
-                cx,
-                Self::toggle_replace,
-            ))
+            .when(!references, |this| {
+                this.child(render_local_action_button(
+                    "project-search",
+                    IconName::Replace,
+                    self.active_project_search
+                        .as_ref()
+                        .map(|search| search.read(cx).replace_enabled)
+                        .and_then(|enabled| enabled.then_some(ActionButtonState::Toggled)),
+                    "Toggle Replace",
+                    &ToggleReplace,
+                    focus_handle.clone(),
+                    cx,
+                    Self::toggle_replace,
+                ))
+            })
             .child(matches_column);
 
         let is_collapsed = search.results_editor.read(cx).has_any_buffer_folded(cx);
@@ -3375,10 +3401,19 @@ impl Render for ProjectSearchBar {
             .w_full()
             .gap_2()
             .child(expand_button)
-            .child(query_column)
+            .map(|this| match references_title {
+                Some(title) => this.child(
+                    h_flex()
+                        .flex_1()
+                        .h_8()
+                        .px_2()
+                        .child(Label::new(title).truncate()),
+                ),
+                None => this.child(query_column),
+            })
             .child(mode_column);
 
-        let replace_line = search.replace_enabled.then(|| {
+        let replace_line = (search.replace_enabled && !references).then(|| {
             let replace_column = input_base_styles(InputPanel::Replacement).child(
                 div().flex_1().py_1().child(render_text_input(
                     &search.replacement_editor,
@@ -3420,7 +3455,7 @@ impl Render for ProjectSearchBar {
                 .child(replace_actions)
         });
 
-        let filter_line = search.filters_enabled.then(|| {
+        let filter_line = (search.filters_enabled && !references).then(|| {
             let include = input_base_styles(InputPanel::Include)
                 .on_action(cx.listener(|this, action, window, cx| {
                     this.previous_history_query(action, window, cx)
@@ -7005,6 +7040,120 @@ pub mod tests {
             );
             let query_text = search_view.query_editor.read(cx).text(cx);
             assert_eq!(query_text, "Uppercase_Query");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_references_view(cx: &mut TestAppContext) {
+        use editor::ReferencesViewOpener;
+        use results_tree::ResultsTreeRow;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "src": {
+                    "one.rs": "let a = TWO;\nlet b = TWO;",
+                    "two.rs": "const TWO: u8 = 2;",
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let mut locations = std::collections::HashMap::default();
+        for (path, ranges) in [
+            (
+                path!("/dir/src/one.rs"),
+                vec![
+                    BufferPoint::new(0, 8)..BufferPoint::new(0, 11),
+                    BufferPoint::new(1, 8)..BufferPoint::new(1, 11),
+                ],
+            ),
+            (
+                path!("/dir/src/two.rs"),
+                vec![BufferPoint::new(0, 6)..BufferPoint::new(0, 9)],
+            ),
+        ] {
+            let buffer = project
+                .update(cx, |project, cx| project.open_local_buffer(path, cx))
+                .await
+                .unwrap();
+            locations.insert(buffer, ranges);
+        }
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let open_references = |cx: &mut VisualTestContext| {
+            let locations = locations.clone();
+            workspace.update_in(cx, |workspace, window, cx| {
+                let opener = cx.global::<ReferencesViewOpener>().clone();
+                (opener.0)(workspace, locations, "References to TWO".into(), window, cx);
+            });
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item(cx)
+                    .and_then(|item| item.downcast::<ProjectSearchView>())
+                    .expect("references should open in a search view")
+            })
+        };
+
+        let references_view = open_references(cx);
+        references_view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.tab_content_text(0, cx), "References to TWO");
+            assert_eq!(view.entity.read(cx).match_ranges.len(), 3);
+            assert_eq!(view.active_match_index, Some(0));
+            assert!(view.results_editor.focus_handle(cx).is_focused(window));
+            // `editor::OpenExcerpts` needs the workspace.
+            assert!(view.results_editor.read(cx).workspace().is_some());
+
+            // Both files are in the tree, with their references expanded.
+            view.sync_results_tree(cx);
+            let match_rows = view
+                .results_tree
+                .rows()
+                .iter()
+                .filter(|row| matches!(row, ResultsTreeRow::Match { .. }))
+                .count();
+            assert_eq!(match_rows, 3);
+
+            // The references can't be searched again.
+            let search_id = view.entity.read(cx).search_id;
+            view.search(SearchMode::Manual, cx);
+            assert_eq!(view.entity.read(cx).search_id, search_id);
+            assert_eq!(view.entity.read(cx).match_ranges.len(), 3);
+        });
+
+        // Looking up the same references again replaces the tab.
+        let reopened_view = open_references(cx);
+        assert_ne!(reopened_view, references_view);
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active_pane().read(cx).items_len(), 1);
+        });
+
+        // A text search opens its own view instead of reusing the references.
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let search_views = workspace
+                .active_pane()
+                .read(cx)
+                .items_of_type::<ProjectSearchView>()
+                .collect::<Vec<_>>();
+            assert_eq!(search_views.len(), 2);
+            assert!(search_views.contains(&reopened_view));
         });
     }
 

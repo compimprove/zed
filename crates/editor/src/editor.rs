@@ -13510,6 +13510,23 @@ pub fn multibuffer_context_lines(cx: &App) -> u32 {
         .min(32)
 }
 
+/// Opens reference locations in a dedicated view instead of a multibuffer
+/// editor. Set by crates that provide such a view, like `search`.
+#[derive(Clone)]
+pub struct ReferencesViewOpener(
+    pub  Arc<
+        dyn Fn(
+            &mut Workspace,
+            std::collections::HashMap<Entity<Buffer>, Vec<Range<Point>>>,
+            String,
+            &mut Window,
+            &mut Context<Workspace>,
+        ),
+    >,
+);
+
+impl Global for ReferencesViewOpener {}
+
 /// Context lines around search results and reference locations, which need
 /// more of the surrounding code than other multibuffers to be read on their own.
 pub fn search_results_context_lines(cx: &App) -> u32 {

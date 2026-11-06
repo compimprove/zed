@@ -1523,6 +1523,10 @@ impl Editor {
                 } else {
                     format!("References to {target}")
                 };
+                if let Some(opener) = cx.try_global::<ReferencesViewOpener>().cloned() {
+                    (opener.0)(workspace, locations, title, window, cx);
+                    return Navigated::Yes;
+                }
                 let allow_preview = PreviewTabsSettings::get_global(cx)
                     .enable_preview_multibuffer_from_code_navigation;
                 Self::open_locations_in_multibuffer(
