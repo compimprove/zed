@@ -1638,19 +1638,6 @@ impl GitGraph {
         }
     }
 
-    fn graph_viewport_width(&self, window: &Window, cx: &App) -> Pixels {
-        if let Some(width) = self.graph_column_pixel_width(window, cx) {
-            return width;
-        }
-        let container = self.column_widths.read(cx).cached_container_width();
-        let graph_fraction = self.preview_column_fractions(window, cx)[0];
-        if container > px(0.) && graph_fraction > 0.0 {
-            container * graph_fraction
-        } else {
-            self.graph_canvas_content_width()
-        }
-    }
-
     pub fn new(
         repo_id: RepositoryId,
         git_store: Entity<GitStore>,
@@ -2453,19 +2440,19 @@ impl GitGraph {
                 let short_sha = commit.data.sha.display_short();
                 let mut formatted_time = String::new();
                 let subject: SharedString;
-                let author_name: Option<SharedString>;
+                let author_name: SharedString;
                 let author_email: Option<SharedString>;
 
                 if let CommitDataState::Loaded(ref data) = data {
                     subject = data.subject.clone();
-                    author_name = (!data.author_name.is_empty()).then(|| data.author_name.clone());
+                    author_name = data.author_name.clone();
                     author_email =
                         (!data.author_email.is_empty()).then(|| data.author_email.clone());
                     formatted_time =
                         format_timestamp_with(data.commit_timestamp, compact_timestamp_format());
                 } else {
                     subject = "Loading…".into();
-                    author_name = None;
+                    author_name = SharedString::default();
                     author_email = None;
                 }
 
@@ -2567,14 +2554,11 @@ impl GitGraph {
                             .render(window, cx);
                         h_flex()
                             .id(ElementId::NamedInteger("commit-author".into(), idx as u64))
-                            .h(row_height)
                             .items_center()
                             .gap_1p5()
                             .overflow_hidden()
                             .child(avatar)
-                            .when_some(author_name, |this, author_name| {
-                                this.child(column_label(author_name))
-                            })
+                            .child(column_label(author_name))
                             .into_any_element()
                     },
                     column_label(short_sha.into()),
@@ -3717,7 +3701,6 @@ impl GitGraph {
 
         let head_branch_name: Option<SharedString> = repository
             .read(cx)
-            .snapshot()
             .branch
             .as_ref()
             .map(|branch| SharedString::from(branch.name().to_string()));
@@ -3779,6 +3762,17 @@ impl GitGraph {
                     .child(
                         div().absolute().top_2().right_2().child(
                             IconButton::new("close-detail", IconName::Close)
+                                .tooltip({
+                                    let focus_handle = self.focus_handle.clone();
+                                    move |_window, cx: &mut App| {
+                                        Tooltip::for_action_in(
+                                            "Close Details Panel",
+                                            &Cancel,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
+                                })
                                 .icon_size(IconSize::Small)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.selected_entry_idx = None;
@@ -3995,6 +3989,11 @@ impl GitGraph {
                                             "view-on-provider",
                                             format!("View on {}", provider_name),
                                         )
+                                        .tooltip({
+                                            move |_window, cx: &mut App| {
+                                                Tooltip::simple("Open In Browser", cx)
+                                            }
+                                        })
                                         .start_icon(
                                             Icon::new(icon)
                                                 .size(IconSize::Small)
@@ -4364,8 +4363,7 @@ impl GitGraph {
         let first_visible_row = (scroll_offset_y / row_height).floor() as usize;
         let vertical_scroll_offset = scroll_offset_y - (first_visible_row as f32 * row_height);
 
-        let canvas_viewport_width = self.graph_viewport_width(window, cx).max(px(0.));
-        let graph_width = self.graph_canvas_content_width().max(canvas_viewport_width);
+        let graph_content_width = self.graph_canvas_content_width();
         let last_visible_row = first_visible_row + visible_row_count + 1;
 
         let viewport_range = first_visible_row.min(loaded_commit_count.saturating_sub(1))
@@ -4540,7 +4538,8 @@ impl GitGraph {
                 })
             },
         )
-        .w(graph_width)
+        .w_full()
+        .min_w(graph_content_width)
         .h_full()
     }
 
@@ -4795,8 +4794,8 @@ impl GitGraph {
                     .w_full()
                     .gap_1()
                     .child(
-                        Disclosure::new("toggle-commit-message", !collapsed).on_click(cx.listener(
-                            |this, _, _, cx| {
+                        Disclosure::new("toggle-commit-message", !collapsed)
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.commit_details_message_collapsed =
                                     !this.commit_details_message_collapsed;
                                 write_commit_details_collapsed(
@@ -4805,8 +4804,16 @@ impl GitGraph {
                                     cx,
                                 );
                                 cx.notify();
-                            },
-                        )),
+                            }))
+                            .tooltip({
+                                let label = if !collapsed {
+                                    "Hide Commit Message"
+                                } else {
+                                    "Show Commit Message"
+                                };
+
+                                move |_window, cx: &mut App| Tooltip::simple(label, cx)
+                            }),
                     )
                     .child(
                         Label::new("Message")
@@ -8516,7 +8523,7 @@ mod tests {
             // Closing a sidebar doesn't change any column but Description.
             let narrower = fit(graph, px(900.), window, cx);
             assert!(narrower == wide);
-            assert_eq!(graph.graph_viewport_width(window, cx), graph_width);
+            assert_eq!(graph.graph_column_pixel_width(window, cx), Some(graph_width));
             let fractions = graph.preview_column_fractions(window, cx);
             let total: f32 = fractions.iter().sum();
             assert!((total - 1.0).abs() < 1e-4, "fractions sum to {total}");
