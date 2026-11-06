@@ -22,6 +22,7 @@ use ui::{
 };
 
 use super::{HighlightKey, ProjectSearchView, ViewEvent};
+use workspace::item::Item as _;
 
 const DEFAULT_WIDTH: Pixels = px(260.);
 const MIN_WIDTH: Pixels = px(140.);
@@ -512,6 +513,18 @@ impl ProjectSearchView {
                 cx.emit(ViewEvent::EditorEvent(event.clone()));
             }),
         ];
+        // Actions like `editor::OpenExcerpts` open files through the editor's
+        // workspace, which only the results editor receives from the pane.
+        if let Some(workspace) = self.workspace.upgrade() {
+            let editor = editor.clone();
+            window.defer(cx, move |window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.added_to_workspace(workspace, window, cx)
+                    })
+                });
+            });
+        }
         let had_focus = self
             .visible_results_editor()
             .focus_handle(cx)

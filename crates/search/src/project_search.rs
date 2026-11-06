@@ -7147,6 +7147,8 @@ pub mod tests {
                 assert!(!text.contains("const TWO"), "{text:?}");
                 assert_eq!(selected_text(&editor, cx), "TWO");
                 assert!(editor.focus_handle(cx).is_focused(window));
+                // `editor::OpenExcerpts` (`g space` in Vim) needs the workspace.
+                assert!(editor.read(cx).workspace().is_some());
             })
             .unwrap();
         draw(cx);
